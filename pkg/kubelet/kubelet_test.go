@@ -186,6 +186,44 @@ func TestSyncPodsDoesNothing(t *testing.T) {
 	verifyCalls(t, fakeDocker, []string{"list", "list", "inspect_container", "inspect_container"})
 }
 
+func TestSyncPodsWithTerminationLog(t *testing.T) {
+	kubelet, _, fakeDocker := newTestKubelet(t)
+	container := api.Container{
+		Name: "bar",
+		TerminationMessagePath: "/dev/somepath",
+	}
+	fakeDocker.ContainerList = []docker.APIContainers{}
+	err := kubelet.SyncPods([]api.BoundPod{
+		{
+			ObjectMeta: api.ObjectMeta{
+				Name:        "foo",
+				Namespace:   "new",
+				Annotations: map[string]string{ConfigSourceAnnotationKey: "test"},
+			},
+			Spec: api.PodSpec{
+				Containers: []api.Container{
+					container,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	kubelet.drainWorkers()
+	verifyCalls(t, fakeDocker, []string{
+		"list", "create", "start", "list", "inspect_container", "list", "create", "start"})
+
+	fakeDocker.Lock()
+	parts := strings.Split(fakeDocker.Container.HostConfig.Binds[0], ":")
+	if fakeDocker.Container.HostConfig == nil ||
+		!matchString(t, "/tmp/kubelet/foo/bar/k8s_bar\\.[a-f0-9]", parts[0]) ||
+		parts[1] != "/dev/somepath" {
+		t.Errorf("Unexpected containers created %v", fakeDocker.Container)
+	}
+	fakeDocker.Unlock()
+}
+
 // drainWorkers waits until all workers are done.  Should only used for testing.
 func (kl *Kubelet) drainWorkers() {
 	for {
@@ -559,15 +597,17 @@ func TestSyncPodBadHash(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	verifyCalls(t, fakeDocker, []string{"list", "stop", "list", "create", "start"})
+	verifyCalls(t, fakeDocker, []string{"list", "stop", "stop", "list", "create", "start"})
 
 	// A map interation is used to delete containers, so must not depend on
 	// order here.
 	expectedToStop := map[string]bool{
 		"1234": true,
+		"9876": true,
 	}
-	if len(fakeDocker.Stopped) != 1 ||
-		!expectedToStop[fakeDocker.Stopped[0]] {
+	if len(fakeDocker.Stopped) != 2 ||
+		(!expectedToStop[fakeDocker.Stopped[0]] &&
+			!expectedToStop[fakeDocker.Stopped[1]]) {
 		t.Errorf("Wrong containers were stopped: %v", fakeDocker.Stopped)
 	}
 }
@@ -607,15 +647,17 @@ func TestSyncPodUnhealthy(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	verifyCalls(t, fakeDocker, []string{"list", "stop", "list", "create", "start"})
+	verifyCalls(t, fakeDocker, []string{"list", "stop", "stop", "list", "create", "start"})
 
 	// A map interation is used to delete containers, so must not depend on
 	// order here.
 	expectedToStop := map[string]bool{
 		"1234": true,
+		"9876": true,
 	}
-	if len(fakeDocker.Stopped) != 1 ||
-		!expectedToStop[fakeDocker.Stopped[0]] {
+	if len(fakeDocker.Stopped) != 2 ||
+		(!expectedToStop[fakeDocker.Stopped[0]] &&
+			expectedToStop[fakeDocker.Stopped[0]]) {
 		t.Errorf("Wrong containers were stopped: %v", fakeDocker.Stopped)
 	}
 }
@@ -1486,4 +1528,45 @@ func TestPurgeOldest(t *testing.T) {
 			t.Errorf("expected: %v, got: %v", test.expectedRemoved, fakeDocker.Removed)
 		}
 	}
+}
+
+func TestSyncPodsWithPullPolicy(t *testing.T) {
+	kubelet, _, fakeDocker := newTestKubelet(t)
+	puller := kubelet.dockerPuller.(*dockertools.FakeDockerPuller)
+	puller.HasImages = []string{"existing_one", "want:latest"}
+	kubelet.networkContainerImage = "custom_image_name"
+	fakeDocker.ContainerList = []docker.APIContainers{}
+	err := kubelet.SyncPods([]api.BoundPod{
+		{
+			ObjectMeta: api.ObjectMeta{
+				Name:        "foo",
+				Namespace:   "new",
+				Annotations: map[string]string{ConfigSourceAnnotationKey: "test"},
+			},
+			Spec: api.PodSpec{
+				Containers: []api.Container{
+					{Name: "bar", Image: "pull_always_image", ImagePullPolicy: api.PullAlways},
+					{Name: "bar1", Image: "pull_never_image", ImagePullPolicy: api.PullNever},
+					{Name: "bar2", Image: "pull_if_not_present_image", ImagePullPolicy: api.PullIfNotPresent},
+					{Name: "bar3", Image: "existing_one", ImagePullPolicy: api.PullIfNotPresent},
+					{Name: "bar4", Image: "want:latest", ImagePullPolicy: api.PullIfNotPresent},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	kubelet.drainWorkers()
+
+	fakeDocker.Lock()
+
+	if !reflect.DeepEqual(puller.ImagesPulled, []string{"custom_image_name", "pull_always_image", "pull_if_not_present_image", "want:latest"}) {
+		t.Errorf("Unexpected pulled containers: %v", puller.ImagesPulled)
+	}
+
+	if len(fakeDocker.Created) != 6 {
+		t.Errorf("Unexpected containers created %v", fakeDocker.Created)
+	}
+	fakeDocker.Unlock()
 }

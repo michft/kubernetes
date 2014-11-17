@@ -17,12 +17,18 @@ limitations under the License.
 package master
 
 import (
+	"bytes"
+	_ "expvar"
+	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	rt "runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/latest"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/v1beta1"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/v1beta2"
@@ -30,6 +36,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/auth/authenticator"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/auth/authenticator/bearertoken"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/auth/authenticator/tokenfile"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/auth/authorizer"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/auth/handlers"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider"
@@ -47,6 +54,8 @@ import (
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/ui"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 
+	"github.com/emicklei/go-restful"
+	"github.com/emicklei/go-restful/swagger"
 	"github.com/golang/glog"
 )
 
@@ -60,13 +69,12 @@ type Config struct {
 	MinionRegexp          string
 	KubeletClient         client.KubeletClient
 	PortalNet             *net.IPNet
-	Mux                   apiserver.Mux
 	EnableLogsSupport     bool
 	EnableUISupport       bool
 	APIPrefix             string
 	CorsAllowedOriginList util.StringList
 	TokenAuthFile         string
-	AuthorizationMode     string
+	Authorizer            authorizer.Authorizer
 
 	// Number of masters running; all masters must be started with the
 	// same value for this field. (Numbers > 1 currently untested.)
@@ -97,20 +105,23 @@ type Master struct {
 	client                *client.Client
 	portalNet             *net.IPNet
 	mux                   apiserver.Mux
+	handlerContainer      *restful.Container
+	rootWebService        *restful.WebService
 	enableLogsSupport     bool
 	enableUISupport       bool
 	apiPrefix             string
 	corsAllowedOriginList util.StringList
 	tokenAuthFile         string
-	authorizationzMode    string
+	authorizer            authorizer.Authorizer
 	masterCount           int
-
-	// "Outputs"
-	Handler http.Handler
 
 	readOnlyServer  string
 	readWriteServer string
 	masterServices  *util.Runner
+
+	// "Outputs"
+	Handler         http.Handler
+	InsecureHandler http.Handler
 }
 
 // NewEtcdHelper returns an EtcdHelper for the provided arguments or an error if the version
@@ -147,7 +158,7 @@ func setDefaults(c *Config) {
 	if c.ReadWritePort == 0 {
 		c.ReadWritePort = 443
 	}
-	if c.PublicAddress == "" {
+	for c.PublicAddress == "" {
 		// Find and use the first non-loopback address.
 		// TODO: potentially it'd be useful to skip the docker interface if it
 		// somehow is first in the list.
@@ -172,7 +183,9 @@ func setDefaults(c *Config) {
 			break
 		}
 		if !found {
-			glog.Fatalf("Unable to find suitible network address in list: %v", addrs)
+			glog.Errorf("Unable to find suitible network address in list: '%v'\n"+
+				"Will try again in 5 seconds. Set the public address directly to avoid this wait.", addrs)
+			time.Sleep(5 * time.Second)
 		}
 	}
 }
@@ -192,6 +205,8 @@ func setDefaults(c *Config) {
 //   http.Handler which handles all the endpoints provided by the master,
 //   including the API, the UI, and miscelaneous debugging endpoints.  All
 //   these are subject to authorization and authentication.
+//   InsecureHandler -- an http.Handler which handles all the same
+//   endpoints as Handler, but no authorization and authentication is done.
 // Public methods:
 //   HandleWithAuth -- Allows caller to add an http.Handler for an endpoint
 //   that uses the same authentication and authorization (if any is configured)
@@ -206,6 +221,10 @@ func New(c *Config) *Master {
 	boundPodFactory := &pod.BasicBoundPodFactory{
 		ServiceRegistry: serviceRegistry,
 	}
+	if c.KubeletClient == nil {
+		glog.Fatalf("master.New() called with config.KubeletClient == nil")
+	}
+	mx := http.NewServeMux()
 	m := &Master{
 		podRegistry:           etcd.NewRegistry(c.EtcdHelper, boundPodFactory),
 		controllerRegistry:    etcd.NewRegistry(c.EtcdHelper, nil),
@@ -216,13 +235,15 @@ func New(c *Config) *Master {
 		minionRegistry:        minionRegistry,
 		client:                c.Client,
 		portalNet:             c.PortalNet,
-		mux:                   http.NewServeMux(),
+		mux:                   mx,
+		handlerContainer:      NewHandlerContainer(mx),
+		rootWebService:        new(restful.WebService),
 		enableLogsSupport:     c.EnableLogsSupport,
 		enableUISupport:       c.EnableUISupport,
 		apiPrefix:             c.APIPrefix,
 		corsAllowedOriginList: c.CorsAllowedOriginList,
 		tokenAuthFile:         c.TokenAuthFile,
-		authorizationzMode:    c.AuthorizationMode,
+		authorizer:            c.Authorizer,
 
 		masterCount:     c.MasterCount,
 		readOnlyServer:  net.JoinHostPort(c.PublicAddress, strconv.Itoa(int(c.ReadOnlyPort))),
@@ -241,6 +262,7 @@ func (m *Master) HandleWithAuth(pattern string, handler http.Handler) {
 	// URLs into attributes that an Authorizer can understand, and have
 	// sensible policy defaults for plugged-in endpoints.  This will be different
 	// for generic endpoints versus REST object endpoints.
+	// TODO: convert to go-restful
 	m.mux.Handle(pattern, handler)
 }
 
@@ -248,7 +270,29 @@ func (m *Master) HandleWithAuth(pattern string, handler http.Handler) {
 // Applies the same authentication and authorization (if any is configured)
 // to the request is used for the master's built-in endpoints.
 func (m *Master) HandleFuncWithAuth(pattern string, handler func(http.ResponseWriter, *http.Request)) {
+	// TODO: convert to go-restful
 	m.mux.HandleFunc(pattern, handler)
+}
+
+func NewHandlerContainer(mux *http.ServeMux) *restful.Container {
+	container := restful.NewContainer()
+	container.ServeMux = mux
+	container.RecoverHandler(logStackOnRecover)
+	return container
+}
+
+//TODO: Unify with RecoverPanics?
+func logStackOnRecover(panicReason interface{}, httpWriter http.ResponseWriter) {
+	var buffer bytes.Buffer
+	buffer.WriteString(fmt.Sprintf("recover from panic situation: - %v\r\n", panicReason))
+	for i := 2; ; i += 1 {
+		_, file, line, ok := rt.Caller(i)
+		if !ok {
+			break
+		}
+		buffer.WriteString(fmt.Sprintf("    %s:%d\r\n", file, line))
+	}
+	glog.Errorln(buffer.String())
 }
 
 func makeMinionRegistry(c *Config) minion.Registry {
@@ -274,6 +318,7 @@ func (m *Master) init(c *Config) {
 		authenticator = bearertoken.New(tokenAuthenticator)
 	}
 
+	// TODO: Factor out the core API registration
 	m.storage = map[string]apiserver.RESTStorage{
 		"pods": pod.NewREST(&pod.RESTConfig{
 			CloudProvider: c.Cloud,
@@ -292,11 +337,18 @@ func (m *Master) init(c *Config) {
 		"bindings": binding.NewREST(m.bindingRegistry),
 	}
 
-	apiserver.NewAPIGroup(m.API_v1beta1()).InstallREST(m.mux, c.APIPrefix+"/v1beta1")
-	apiserver.NewAPIGroup(m.API_v1beta2()).InstallREST(m.mux, c.APIPrefix+"/v1beta2")
+	apiserver.NewAPIGroupVersion(m.API_v1beta1()).InstallREST(m.handlerContainer, c.APIPrefix, "v1beta1")
+	apiserver.NewAPIGroupVersion(m.API_v1beta2()).InstallREST(m.handlerContainer, c.APIPrefix, "v1beta2")
+
+	// TODO: InstallREST should register each version automatically
 	versionHandler := apiserver.APIVersionHandler("v1beta1", "v1beta2")
-	m.mux.Handle(c.APIPrefix, versionHandler)
-	apiserver.InstallSupport(m.mux)
+	m.rootWebService.Route(m.rootWebService.GET(c.APIPrefix).To(versionHandler))
+
+	apiserver.InstallSupport(m.handlerContainer, m.rootWebService)
+
+	// TODO: use go-restful
+	serversToValidate := m.getServersToValidate(c)
+	apiserver.InstallValidator(m.mux, serversToValidate)
 	if c.EnableLogsSupport {
 		apiserver.InstallLogsSupport(m.mux)
 	}
@@ -304,7 +356,14 @@ func (m *Master) init(c *Config) {
 		ui.InstallSupport(m.mux)
 	}
 
+	// TODO: install runtime/pprof handler
+	// See github.com/emicklei/go-restful/blob/master/examples/restful-cpuprofiler-service.go
+
 	handler := http.Handler(m.mux.(*http.ServeMux))
+
+	// TODO: handle CORS and auth using go-restful
+	// See github.com/emicklei/go-restful/blob/master/examples/restful-CORS-filter.go, and
+	// github.com/emicklei/go-restful/blob/master/examples/restful-basic-authentication.go
 
 	if len(c.CorsAllowedOriginList) > 0 {
 		allowedOriginRegexps, err := util.CompileRegexps(c.CorsAllowedOriginList)
@@ -314,23 +373,74 @@ func (m *Master) init(c *Config) {
 		handler = apiserver.CORS(handler, allowedOriginRegexps, nil, nil, "true")
 	}
 
-	// Install Authorizer
-	authorizer, err := apiserver.NewAuthorizerFromAuthorizationConfig(m.authorizationzMode)
-	if err != nil {
-		glog.Fatal(err)
-	}
-	handler = apiserver.WithAuthorizationCheck(handler, apiserver.BasicAttributeGetter, authorizer)
+	m.InsecureHandler = handler
+
+	attributeGetter := apiserver.NewRequestAttributeGetter(userContexts)
+	handler = apiserver.WithAuthorizationCheck(handler, attributeGetter, m.authorizer)
 
 	// Install Authenticator
 	if authenticator != nil {
 		handler = handlers.NewRequestAuthenticator(userContexts, authenticator, handlers.Unauthorized, handler)
 	}
-	m.mux.HandleFunc("/_whoami", handleWhoAmI(authenticator))
+	// TODO: Remove temporary _whoami handler
+	m.rootWebService.Route(m.rootWebService.GET("/_whoami").To(handleWhoAmI(authenticator)))
+
+	// Install root web services
+	m.handlerContainer.Add(m.rootWebService)
+
+	// TODO: Make this optional?
+	// Enable swagger UI and discovery API
+	swaggerConfig := swagger.Config{
+		WebServices: m.handlerContainer.RegisteredWebServices(),
+		// TODO: Parameterize the path?
+		ApiPath: "/swaggerapi/",
+		// TODO: Distribute UI javascript and enable the UI
+		//SwaggerPath: "/swaggerui/",
+		//SwaggerFilePath: "/srv/apiserver/swagger/dist"
+	}
+	swagger.RegisterSwaggerService(swaggerConfig, m.handlerContainer)
 
 	m.Handler = handler
 
 	// TODO: Attempt clean shutdown?
 	m.masterServices.Start()
+}
+
+func (m *Master) getServersToValidate(c *Config) map[string]apiserver.Server {
+	serversToValidate := map[string]apiserver.Server{
+		"controller-manager": {Addr: "127.0.0.1", Port: 10252, Path: "/healthz"},
+		"scheduler":          {Addr: "127.0.0.1", Port: 10251, Path: "/healthz"},
+	}
+	for ix, machine := range c.EtcdHelper.Client.GetCluster() {
+		etcdUrl, err := url.Parse(machine)
+		if err != nil {
+			glog.Errorf("Failed to parse etcd url for validation: %v", err)
+			continue
+		}
+		var port int
+		var addr string
+		if strings.Contains(etcdUrl.Host, ":") {
+			var portString string
+			addr, portString, err = net.SplitHostPort(etcdUrl.Host)
+			if err != nil {
+				glog.Errorf("Failed to split host/port: %s (%v)", etcdUrl.Host, err)
+				continue
+			}
+			port, _ = strconv.Atoi(portString)
+		} else {
+			addr = etcdUrl.Host
+			port = 4001
+		}
+		serversToValidate[fmt.Sprintf("etcd-%d", ix)] = apiserver.Server{Addr: addr, Port: port, Path: "/v2/keys/"}
+	}
+	nodes, err := m.minionRegistry.ListMinions(api.NewDefaultContext())
+	if err != nil {
+		glog.Errorf("Failed to list minions: %v", err)
+	}
+	for ix, node := range nodes.Items {
+		serversToValidate[fmt.Sprintf("node-%d", ix)] = apiserver.Server{Addr: node.HostIP, Port: 10250, Path: "/healthz"}
+	}
+	return serversToValidate
 }
 
 // API_v1beta1 returns the resources and codec for API version v1beta1.

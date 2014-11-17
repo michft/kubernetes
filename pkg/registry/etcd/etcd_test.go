@@ -42,41 +42,6 @@ func NewTestEtcdRegistry(client tools.EtcdClient) *Registry {
 	return registry
 }
 
-func TestEtcdParseWatchResourceVersion(t *testing.T) {
-	testCases := []struct {
-		Version       string
-		Kind          string
-		ExpectVersion uint64
-		Err           bool
-	}{
-		{Version: "", ExpectVersion: 0},
-		{Version: "a", Err: true},
-		{Version: " ", Err: true},
-		{Version: "1", ExpectVersion: 2},
-		{Version: "10", ExpectVersion: 11},
-	}
-	for _, testCase := range testCases {
-		version, err := ParseWatchResourceVersion(testCase.Version, testCase.Kind)
-		switch {
-		case testCase.Err:
-			if err == nil {
-				t.Errorf("%s: unexpected non-error", testCase.Version)
-				continue
-			}
-			if !errors.IsInvalid(err) {
-				t.Errorf("%s: unexpected error: %v", testCase.Version, err)
-				continue
-			}
-		case !testCase.Err && err != nil:
-			t.Errorf("%s: unexpected error: %v", testCase.Version, err)
-			continue
-		}
-		if version != testCase.ExpectVersion {
-			t.Errorf("%s: expected version %d but was %d", testCase.Version, testCase.ExpectVersion, version)
-		}
-	}
-}
-
 // TestEtcdGetPodDifferentNamespace ensures same-name pods in different namespaces do not clash
 func TestEtcdGetPodDifferentNamespace(t *testing.T) {
 	fakeClient := tools.NewFakeEtcdClient(t)
@@ -960,7 +925,7 @@ func TestEtcdUpdateController(t *testing.T) {
 	registry := NewTestEtcdRegistry(fakeClient)
 	err := registry.UpdateController(ctx, &api.ReplicationController{
 		ObjectMeta: api.ObjectMeta{Name: "foo", ResourceVersion: strconv.FormatUint(resp.Node.ModifiedIndex, 10)},
-		DesiredState: api.ReplicationControllerState{
+		Spec: api.ReplicationControllerSpec{
 			Replicas: 2,
 		},
 	})
@@ -969,7 +934,7 @@ func TestEtcdUpdateController(t *testing.T) {
 	}
 
 	ctrl, err := registry.GetController(ctx, "foo")
-	if ctrl.DesiredState.Replicas != 2 {
+	if ctrl.Spec.Replicas != 2 {
 		t.Errorf("Unexpected controller: %#v", ctrl)
 	}
 }
@@ -1144,27 +1109,28 @@ func TestEtcdUpdateService(t *testing.T) {
 	ctx := api.NewDefaultContext()
 	fakeClient := tools.NewFakeEtcdClient(t)
 	fakeClient.TestIndex = true
-	key, _ := makeServiceKey(ctx, "foo")
-	resp, _ := fakeClient.Set(key, runtime.EncodeOrDie(latest.Codec, &api.Service{ObjectMeta: api.ObjectMeta{Name: "foo"}}), 0)
+	key, _ := makeServiceKey(ctx, "uniquefoo")
+	resp, _ := fakeClient.Set(key, runtime.EncodeOrDie(latest.Codec, &api.Service{ObjectMeta: api.ObjectMeta{Name: "uniquefoo"}}), 0)
 	registry := NewTestEtcdRegistry(fakeClient)
 	testService := api.Service{
 		ObjectMeta: api.ObjectMeta{
-			Name:            "foo",
+			Name:            "uniquefoo",
 			ResourceVersion: strconv.FormatUint(resp.Node.ModifiedIndex, 10),
 			Labels: map[string]string{
 				"baz": "bar",
 			},
 		},
-		Selector: map[string]string{
-			"baz": "bar",
+		Spec: api.ServiceSpec{
+			Selector: map[string]string{
+				"baz": "bar",
+			},
 		},
 	}
 	err := registry.UpdateService(ctx, &testService)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-
-	svc, err := registry.GetService(ctx, "foo")
+	svc, err := registry.GetService(ctx, "uniquefoo")
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}

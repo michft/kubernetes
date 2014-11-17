@@ -26,11 +26,13 @@ base:
 
   'roles:kubernetes-master':
     - match: grain
+    - generate-cert
     - etcd
-    - apiserver
-    - controller-manager
-    - scheduler
+    - kube-apiserver
+    - kube-controller-manager
+    - kube-scheduler
     - nginx
+    - kube-client-tools
     - logrotate
 {% if grains['cloud'] is defined and grains['cloud'] == 'azure' %}
     - openvpn

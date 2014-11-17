@@ -43,6 +43,29 @@ function kube-up {
   get-password
   vagrant up
 
+  local kube_cert=".kubecfg.vagrant.crt"
+  local kube_key=".kubecfg.vagrant.key"
+  local ca_cert=".kubernetes.vagrant.ca.crt"
+
+  (umask 077
+   vagrant ssh master -- sudo cat /srv/kubernetes/kubecfg.crt >"${HOME}/${kube_cert}" 2>/dev/null
+   vagrant ssh master -- sudo cat /srv/kubernetes/kubecfg.key >"${HOME}/${kube_key}" 2>/dev/null
+   vagrant ssh master -- sudo cat /srv/kubernetes/ca.crt >"${HOME}/${ca_cert}" 2>/dev/null
+
+   cat << EOF > ~/.kubernetes_vagrant_auth
+{
+  "User": "$KUBE_USER",
+  "Password": "$KUBE_PASSWORD",
+  "CAFile": "$HOME/$ca_cert",
+  "CertFile": "$HOME/$kube_cert",
+  "KeyFile": "$HOME/$kube_key"
+}
+EOF
+
+   chmod 0600 ~/.kubernetes_auth "${HOME}/${kube_cert}" \
+     "${HOME}/${kube_key}" "${HOME}/${ca_cert}"
+  )
+
   echo "Each machine instance has been created."
   echo "  Now waiting for the Salt provisioning process to complete on each machine."
   echo "  This can take some time based on your network, disk, and cpu speed."
@@ -51,7 +74,7 @@ function kube-up {
   # verify master has all required daemons
   echo "Validating master"
   local machine="master"
-  local -a required_daemon=("salt-master" "salt-minion" "apiserver" "nginx" "controller-manager" "scheduler")
+  local -a required_daemon=("salt-master" "salt-minion" "kube-apiserver" "nginx" "kube-controller-manager" "kube-scheduler")
   local validated="1"
   until [[ "$validated" == "0" ]]; do
     validated="0"
@@ -92,7 +115,7 @@ function kube-up {
     local count="0"
     until [[ "$count" == "1" ]]; do
       local minions
-      minions=$("${KUBE_ROOT}/cluster/kubecfg.sh" -template '{{range.Items}}{{.Name}}:{{end}}' list minions)
+      minions=$("${KUBE_ROOT}/cluster/kubecfg.sh" -template '{{range.items}}{{.id}}:{{end}}' list minions)
       count=$(echo $minions | grep -c "${MINION_NAMES[i]}") || {
         printf "."
         sleep 2
@@ -108,7 +131,7 @@ function kube-up {
   echo
   echo "  https://${KUBE_MASTER_IP}"
   echo
-  echo "The user name and password to use is located in ~/.kubernetes_auth."
+  echo "The user name and password to use is located in ~/.kubernetes_vagrant_auth."
   echo
 }
 
@@ -124,7 +147,8 @@ function kube-push {
 
 # Execute prior to running tests to build a release if required for env
 function test-build-release {
-  echo "Vagrant provider can skip release build"
+  # Make a release
+  "${KUBE_ROOT}/build/release.sh"
 }
 
 # Execute prior to running tests to initialize required structure
@@ -170,4 +194,17 @@ function ssh-to-node {
 # Restart the kube-proxy on a node ($1)
 function restart-kube-proxy {
   ssh-to-node "$1" "sudo systemctl restart kube-proxy"
+}
+
+function setup-monitoring {
+    echo "TODO"
+}
+
+function teardown-monitoring {
+  echo "TODO"
+}
+
+# Perform preparations required to run e2e tests
+function prepare-e2e() {
+  echo "Vagrant doesn't need special preparations for e2e tests"
 }

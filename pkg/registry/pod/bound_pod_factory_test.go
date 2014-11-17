@@ -54,6 +54,10 @@ func TestMakeBoundPodNoServices(t *testing.T) {
 	if pod.Name != "foobar" {
 		t.Errorf("Failed to assign ID to pod: %#v", pod.Name)
 	}
+
+	if _, err := api.GetReference(pod); err != nil {
+		t.Errorf("Unable to get a reference to bound pod: %v", err)
+	}
 }
 
 func TestMakeBoundPodServices(t *testing.T) {
@@ -62,12 +66,14 @@ func TestMakeBoundPodServices(t *testing.T) {
 			Items: []api.Service{
 				{
 					ObjectMeta: api.ObjectMeta{Name: "test"},
-					Port:       8080,
-					ContainerPort: util.IntOrString{
-						Kind:   util.IntstrInt,
-						IntVal: 900,
+					Spec: api.ServiceSpec{
+						Port: 8080,
+						ContainerPort: util.IntOrString{
+							Kind:   util.IntstrInt,
+							IntVal: 900,
+						},
+						PortalIP: "1.2.3.4",
 					},
-					PortalIP: "1.2.3.4",
 				},
 			},
 		},
@@ -138,12 +144,14 @@ func TestMakeBoundPodServicesExistingEnvVar(t *testing.T) {
 			Items: []api.Service{
 				{
 					ObjectMeta: api.ObjectMeta{Name: "test"},
-					Port:       8080,
-					ContainerPort: util.IntOrString{
-						Kind:   util.IntstrInt,
-						IntVal: 900,
+					Spec: api.ServiceSpec{
+						Port: 8080,
+						ContainerPort: util.IntOrString{
+							Kind:   util.IntstrInt,
+							IntVal: 900,
+						},
+						PortalIP: "1.2.3.4",
 					},
-					PortalIP: "1.2.3.4",
 				},
 			},
 		},

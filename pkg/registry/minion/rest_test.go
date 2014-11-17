@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/errors"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/registrytest"
 )
@@ -42,6 +43,9 @@ func TestMinionREST(t *testing.T) {
 		t.Errorf("insert failed")
 	}
 	obj := <-c
+	if !api.HasObjectMetaSystemFieldValues(&obj.Object.(*api.Minion).ObjectMeta) {
+		t.Errorf("storage did not populate object meta field values")
+	}
 	if m, ok := obj.Object.(*api.Minion); !ok || m.Name != "baz" {
 		t.Errorf("insert return value was weird: %#v", obj)
 	}
@@ -83,6 +87,29 @@ func TestMinionREST(t *testing.T) {
 	}
 }
 
+func TestMinionRESTWithHealthCheck(t *testing.T) {
+	minionRegistry := registrytest.NewMinionRegistry([]string{}, api.NodeResources{})
+	minionHealthRegistry := HealthyRegistry{
+		delegate: minionRegistry,
+		client:   &notMinion{minion: "m1"},
+	}
+
+	ms := NewREST(&minionHealthRegistry)
+	ctx := api.NewContext()
+
+	c, err := ms.Create(ctx, &api.Minion{ObjectMeta: api.ObjectMeta{Name: "m1"}})
+	if err != nil {
+		t.Errorf("insert failed")
+	}
+	result := <-c
+	if m, ok := result.Object.(*api.Minion); !ok || m.Name != "m1" {
+		t.Errorf("insert return value was weird: %#v", result)
+	}
+	if _, err := ms.Get(ctx, "m1"); err == nil {
+		t.Errorf("node is unhealthy, expect no result from apiserver")
+	}
+}
+
 func contains(nodes *api.MinionList, nodeID string) bool {
 	for _, node := range nodes.Items {
 		if node.Name == nodeID {
@@ -90,4 +117,31 @@ func contains(nodes *api.MinionList, nodeID string) bool {
 		}
 	}
 	return false
+}
+
+func TestMinionStorageValidatesCreate(t *testing.T) {
+	storage := NewREST(registrytest.NewMinionRegistry([]string{"foo", "bar"}, api.NodeResources{}))
+	ctx := api.NewContext()
+	validSelector := map[string]string{"a": "b"}
+	invalidSelector := map[string]string{"NoUppercaseOrSpecialCharsLike=Equals": "b"}
+	failureCases := map[string]api.Minion{
+		"zero-length Name": {
+			ObjectMeta: api.ObjectMeta{Name: ""},
+			HostIP:     "something",
+			Labels:     validSelector,
+		},
+		"invalid-labels": {
+			ObjectMeta: api.ObjectMeta{Name: "abc-123"},
+			Labels:     invalidSelector,
+		},
+	}
+	for _, failureCase := range failureCases {
+		c, err := storage.Create(ctx, &failureCase)
+		if c != nil {
+			t.Errorf("Expected nil channel")
+		}
+		if !errors.IsInvalid(err) {
+			t.Errorf("Expected to get an invalid resource error, got %v", err)
+		}
+	}
 }

@@ -185,6 +185,14 @@ func makeImageList(manifest api.ContainerManifest) string {
 	return strings.Join(images, ",")
 }
 
+func makeImageListPodSpec(spec api.PodSpec) string {
+	var images []string
+	for _, container := range spec.Containers {
+		images = append(images, container.Image)
+	}
+	return strings.Join(images, ",")
+}
+
 func podHostString(host, ip string) string {
 	if host == "" && ip == "" {
 		return "<unassigned>"
@@ -211,8 +219,8 @@ func printPodList(podList *api.PodList, w io.Writer) error {
 
 func printReplicationController(controller *api.ReplicationController, w io.Writer) error {
 	_, err := fmt.Fprintf(w, "%s\t%s\t%s\t%d\n",
-		controller.Name, makeImageList(controller.DesiredState.PodTemplate.DesiredState.Manifest),
-		labels.Set(controller.DesiredState.ReplicaSelector), controller.DesiredState.Replicas)
+		controller.Name, makeImageListPodSpec(controller.Spec.Template.Spec),
+		labels.Set(controller.Spec.Selector), controller.Spec.Replicas)
 	return err
 }
 
@@ -227,7 +235,7 @@ func printReplicationControllerList(list *api.ReplicationControllerList, w io.Wr
 
 func printService(svc *api.Service, w io.Writer) error {
 	_, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\n", svc.Name, labels.Set(svc.Labels),
-		labels.Set(svc.Selector), svc.PortalIP, svc.Port)
+		labels.Set(svc.Spec.Selector), svc.Spec.PortalIP, svc.Spec.Port)
 	return err
 }
 
@@ -319,19 +327,32 @@ func (h *HumanReadablePrinter) PrintObj(obj runtime.Object, output io.Writer) er
 
 // TemplatePrinter is an implementation of ResourcePrinter which formats data with a Go Template.
 type TemplatePrinter struct {
-	Template *template.Template
+	template *template.Template
+}
+
+func NewTemplatePrinter(tmpl []byte) (*TemplatePrinter, error) {
+	t, err := template.New("output").Parse(string(tmpl))
+	if err != nil {
+		return nil, err
+	}
+	return &TemplatePrinter{t}, nil
 }
 
 // Print parses the data as JSON, and re-formats it with the Go Template.
 func (t *TemplatePrinter) Print(data []byte, w io.Writer) error {
-	obj, err := latest.Codec.Decode(data)
+	obj := map[string]interface{}{}
+	err := json.Unmarshal(data, &obj)
 	if err != nil {
 		return err
 	}
-	return t.PrintObj(obj, w)
+	return t.template.Execute(w, obj)
 }
 
 // PrintObj formats the obj with the Go Template.
 func (t *TemplatePrinter) PrintObj(obj runtime.Object, w io.Writer) error {
-	return t.Template.Execute(w, obj)
+	data, err := latest.Codec.Encode(obj)
+	if err != nil {
+		return err
+	}
+	return t.Print(data, w)
 }

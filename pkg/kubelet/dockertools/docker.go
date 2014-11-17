@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"hash/adler32"
 	"io"
+	"io/ioutil"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -35,13 +36,6 @@ import (
 	"github.com/fsouza/go-dockerclient"
 	"github.com/golang/glog"
 )
-
-// DockerContainerData is the structured representation of the JSON object returned by Docker inspect
-type DockerContainerData struct {
-	state struct {
-		Running bool
-	}
-}
 
 // DockerInterface is an abstract interface for testability.  It abstracts the interface of docker.Client.
 type DockerInterface interface {
@@ -207,8 +201,8 @@ func (d *dockerContainerCommandRunner) RunInContainer(containerID string, cmd []
 
 // NewDockerContainerCommandRunner creates a ContainerCommandRunner which uses nsinit to run a command
 // inside a container.
-func NewDockerContainerCommandRunner() ContainerCommandRunner {
-	return &dockerContainerCommandRunner{}
+func NewDockerContainerCommandRunner(client DockerInterface) ContainerCommandRunner {
+	return &dockerContainerCommandRunner{client: client}
 }
 
 func (p dockerPuller) Pull(image string) error {
@@ -251,6 +245,16 @@ func (p dockerPuller) IsImagePresent(name string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+// RequireLatestImage returns if the user wants the latest image
+func RequireLatestImage(name string) bool {
+	_, tag := parseImageName(name)
+
+	if tag == "latest" {
+		return true
+	}
+	return false
 }
 
 func (p throttledDockerPuller) IsImagePresent(name string) (bool, error) {
@@ -301,7 +305,7 @@ func GetKubeletDockerContainers(client DockerInterface, allContainers bool) (Doc
 		// TODO(dchen1107): Remove the old separator "--" by end of Oct
 		if !strings.HasPrefix(container.Names[0], "/"+containerNamePrefix+"_") &&
 			!strings.HasPrefix(container.Names[0], "/"+containerNamePrefix+"--") {
-			glog.Infof("Docker Container: %s is not managed by kubelet.", container.Names[0])
+			glog.V(3).Infof("Docker Container: %s is not managed by kubelet.", container.Names[0])
 			continue
 		}
 		result[DockerID(container.ID)] = container
@@ -340,6 +344,7 @@ func GetRecentDockerContainersWithNameAndUUID(client DockerInterface, podFullNam
 // By default the function will return snapshot of the container log
 // Log streaming is possible if 'follow' param is set to true
 // Log tailing is possible when number of tailed lines are set and only if 'follow' is false
+// TODO: Make 'RawTerminal' option  flagable.
 func GetKubeletDockerContainerLogs(client DockerInterface, containerID, tail string, follow bool, stdout, stderr io.Writer) (err error) {
 	opts := docker.LogsOptions{
 		Container:    containerID,
@@ -348,7 +353,7 @@ func GetKubeletDockerContainerLogs(client DockerInterface, containerID, tail str
 		OutputStream: stdout,
 		ErrorStream:  stderr,
 		Timestamps:   true,
-		RawTerminal:  true,
+		RawTerminal:  false,
 		Follow:       follow,
 	}
 
@@ -371,8 +376,9 @@ var (
 	ErrContainerCannotRun = errors.New("Container cannot run")
 )
 
-func inspectContainer(client DockerInterface, dockerID, containerName string) (*api.ContainerStatus, error) {
+func inspectContainer(client DockerInterface, dockerID, containerName, tPath string) (*api.ContainerStatus, error) {
 	inspectResult, err := client.InspectContainer(dockerID)
+
 	if err != nil {
 		return nil, err
 	}
@@ -403,6 +409,17 @@ func inspectContainer(client DockerInterface, dockerID, containerName string) (*
 			StartedAt:  inspectResult.State.StartedAt,
 			FinishedAt: inspectResult.State.FinishedAt,
 		}
+		if tPath != "" {
+			path, found := inspectResult.Volumes[tPath]
+			if found {
+				data, err := ioutil.ReadFile(path)
+				if err != nil {
+					glog.Errorf("Error on reading termination-log %s(%v)", path, err)
+				} else {
+					containerStatus.State.Termination.Message = string(data)
+				}
+			}
+		}
 		waiting = false
 	}
 
@@ -421,6 +438,11 @@ func inspectContainer(client DockerInterface, dockerID, containerName string) (*
 // GetDockerPodInfo returns docker info for all containers in the pod/manifest.
 func GetDockerPodInfo(client DockerInterface, manifest api.PodSpec, podFullName, uuid string) (api.PodInfo, error) {
 	info := api.PodInfo{}
+	expectedContainers := make(map[string]api.Container)
+	for _, container := range manifest.Containers {
+		expectedContainers[container.Name] = container
+	}
+	expectedContainers["net"] = api.Container{}
 
 	containers, err := client.ListContainers(docker.ListContainersOptions{All: true})
 	if err != nil {
@@ -435,6 +457,14 @@ func GetDockerPodInfo(client DockerInterface, manifest api.PodSpec, podFullName,
 		if uuid != "" && dockerUUID != uuid {
 			continue
 		}
+		c, found := expectedContainers[dockerContainerName]
+		terminationMessagePath := ""
+		if !found {
+			// TODO(dchen1107): should figure out why not continue here
+			// continue
+		} else {
+			terminationMessagePath = c.TerminationMessagePath
+		}
 		// We assume docker return us a list of containers in time order
 		if containerStatus, found := info[dockerContainerName]; found {
 			containerStatus.RestartCount += 1
@@ -442,7 +472,7 @@ func GetDockerPodInfo(client DockerInterface, manifest api.PodSpec, podFullName,
 			continue
 		}
 
-		containerStatus, err := inspectContainer(client, value.ID, dockerContainerName)
+		containerStatus, err := inspectContainer(client, value.ID, dockerContainerName, terminationMessagePath)
 		if err != nil {
 			return nil, err
 		}
@@ -613,6 +643,8 @@ func (dk *dockerKeyring) reindex() {
 	sort.Sort(sort.Reverse(sort.StringSlice(dk.index)))
 }
 
+const defaultRegistryHost = "index.docker.io/v1/"
+
 func (dk *dockerKeyring) lookup(image string) (docker.AuthConfiguration, bool) {
 	// range over the index as iterating over a map does not provide
 	// a predictable ordering
@@ -622,6 +654,11 @@ func (dk *dockerKeyring) lookup(image string) (docker.AuthConfiguration, bool) {
 		}
 
 		return dk.creds[k], true
+	}
+
+	// use credentials for the default registry if provided
+	if auth, ok := dk.creds[defaultRegistryHost]; ok {
+		return auth, true
 	}
 
 	return docker.AuthConfiguration{}, false

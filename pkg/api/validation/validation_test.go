@@ -23,6 +23,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/errors"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/capabilities"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/registry/registrytest"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 )
 
@@ -625,16 +626,19 @@ func TestValidatePodUpdate(t *testing.T) {
 
 func TestValidateService(t *testing.T) {
 	testCases := []struct {
-		name    string
-		svc     api.Service
-		numErrs int
+		name     string
+		svc      api.Service
+		existing api.ServiceList
+		numErrs  int
 	}{
 		{
 			name: "missing id",
 			svc: api.Service{
 				ObjectMeta: api.ObjectMeta{Namespace: api.NamespaceDefault},
-				Port:       8675,
-				Selector:   map[string]string{"foo": "bar"},
+				Spec: api.ServiceSpec{
+					Port:     8675,
+					Selector: map[string]string{"foo": "bar"},
+				},
 			},
 			// Should fail because the ID is missing.
 			numErrs: 1,
@@ -643,8 +647,10 @@ func TestValidateService(t *testing.T) {
 			name: "missing namespace",
 			svc: api.Service{
 				ObjectMeta: api.ObjectMeta{Name: "foo"},
-				Port:       8675,
-				Selector:   map[string]string{"foo": "bar"},
+				Spec: api.ServiceSpec{
+					Port:     8675,
+					Selector: map[string]string{"foo": "bar"},
+				},
 			},
 			// Should fail because the Namespace is missing.
 			numErrs: 1,
@@ -653,8 +659,10 @@ func TestValidateService(t *testing.T) {
 			name: "invalid id",
 			svc: api.Service{
 				ObjectMeta: api.ObjectMeta{Name: "123abc", Namespace: api.NamespaceDefault},
-				Port:       8675,
-				Selector:   map[string]string{"foo": "bar"},
+				Spec: api.ServiceSpec{
+					Port:     8675,
+					Selector: map[string]string{"foo": "bar"},
+				},
 			},
 			// Should fail because the ID is invalid.
 			numErrs: 1,
@@ -663,7 +671,9 @@ func TestValidateService(t *testing.T) {
 			name: "missing port",
 			svc: api.Service{
 				ObjectMeta: api.ObjectMeta{Name: "abc123", Namespace: api.NamespaceDefault},
-				Selector:   map[string]string{"foo": "bar"},
+				Spec: api.ServiceSpec{
+					Selector: map[string]string{"foo": "bar"},
+				},
 			},
 			// Should fail because the port number is missing/invalid.
 			numErrs: 1,
@@ -672,8 +682,10 @@ func TestValidateService(t *testing.T) {
 			name: "invalid port",
 			svc: api.Service{
 				ObjectMeta: api.ObjectMeta{Name: "abc123", Namespace: api.NamespaceDefault},
-				Port:       65536,
-				Selector:   map[string]string{"foo": "bar"},
+				Spec: api.ServiceSpec{
+					Port:     66536,
+					Selector: map[string]string{"foo": "bar"},
+				},
 			},
 			// Should fail because the port number is invalid.
 			numErrs: 1,
@@ -682,9 +694,11 @@ func TestValidateService(t *testing.T) {
 			name: "invalid protocol",
 			svc: api.Service{
 				ObjectMeta: api.ObjectMeta{Name: "abc123", Namespace: api.NamespaceDefault},
-				Port:       8675,
-				Protocol:   "INVALID",
-				Selector:   map[string]string{"foo": "bar"},
+				Spec: api.ServiceSpec{
+					Port:     8675,
+					Selector: map[string]string{"foo": "bar"},
+					Protocol: "INVALID",
+				},
 			},
 			// Should fail because the protocol is invalid.
 			numErrs: 1,
@@ -693,7 +707,9 @@ func TestValidateService(t *testing.T) {
 			name: "missing selector",
 			svc: api.Service{
 				ObjectMeta: api.ObjectMeta{Name: "foo", Namespace: api.NamespaceDefault},
-				Port:       8675,
+				Spec: api.ServiceSpec{
+					Port: 8675,
+				},
 			},
 			// Should fail because the selector is missing.
 			numErrs: 1,
@@ -702,9 +718,11 @@ func TestValidateService(t *testing.T) {
 			name: "valid 1",
 			svc: api.Service{
 				ObjectMeta: api.ObjectMeta{Name: "abc123", Namespace: api.NamespaceDefault},
-				Port:       1,
-				Protocol:   "TCP",
-				Selector:   map[string]string{"foo": "bar"},
+				Spec: api.ServiceSpec{
+					Port:     8675,
+					Selector: map[string]string{"foo": "bar"},
+					Protocol: "TCP",
+				},
 			},
 			numErrs: 0,
 		},
@@ -712,9 +730,11 @@ func TestValidateService(t *testing.T) {
 			name: "valid 2",
 			svc: api.Service{
 				ObjectMeta: api.ObjectMeta{Name: "abc123", Namespace: api.NamespaceDefault},
-				Port:       65535,
-				Protocol:   "UDP",
-				Selector:   map[string]string{"foo": "bar"},
+				Spec: api.ServiceSpec{
+					Port:     8675,
+					Selector: map[string]string{"foo": "bar"},
+					Protocol: "UDP",
+				},
 			},
 			numErrs: 0,
 		},
@@ -722,8 +742,76 @@ func TestValidateService(t *testing.T) {
 			name: "valid 3",
 			svc: api.Service{
 				ObjectMeta: api.ObjectMeta{Name: "abc123", Namespace: api.NamespaceDefault},
-				Port:       80,
-				Selector:   map[string]string{"foo": "bar"},
+				Spec: api.ServiceSpec{
+					Port:     8675,
+					Selector: map[string]string{"foo": "bar"},
+				},
+			},
+			numErrs: 0,
+		},
+		{
+			name: "invalid port in use",
+			svc: api.Service{
+				ObjectMeta: api.ObjectMeta{Name: "abc123", Namespace: api.NamespaceDefault},
+				Spec: api.ServiceSpec{
+					Port: 80,
+					CreateExternalLoadBalancer: true,
+					Selector:                   map[string]string{"foo": "bar"},
+				},
+			},
+			existing: api.ServiceList{
+				Items: []api.Service{
+					{Spec: api.ServiceSpec{Port: 80, CreateExternalLoadBalancer: true}},
+				},
+			},
+			numErrs: 1,
+		},
+		{
+			name: "same port in use, but not external",
+			svc: api.Service{
+				ObjectMeta: api.ObjectMeta{Name: "abc123", Namespace: api.NamespaceDefault},
+				Spec: api.ServiceSpec{
+					Port: 80,
+					CreateExternalLoadBalancer: true,
+					Selector:                   map[string]string{"foo": "bar"},
+				},
+			},
+			existing: api.ServiceList{
+				Items: []api.Service{
+					{Spec: api.ServiceSpec{Port: 80}},
+				},
+			},
+			numErrs: 0,
+		},
+		{
+			name: "same port in use, but not external on input",
+			svc: api.Service{
+				ObjectMeta: api.ObjectMeta{Name: "abc123", Namespace: api.NamespaceDefault},
+				Spec: api.ServiceSpec{
+					Port:     80,
+					Selector: map[string]string{"foo": "bar"},
+				},
+			},
+			existing: api.ServiceList{
+				Items: []api.Service{
+					{Spec: api.ServiceSpec{Port: 80, CreateExternalLoadBalancer: true}},
+				},
+			},
+			numErrs: 0,
+		},
+		{
+			name: "same port in use, but neither external",
+			svc: api.Service{
+				ObjectMeta: api.ObjectMeta{Name: "abc123", Namespace: api.NamespaceDefault},
+				Spec: api.ServiceSpec{
+					Port:     80,
+					Selector: map[string]string{"foo": "bar"},
+				},
+			},
+			existing: api.ServiceList{
+				Items: []api.Service{
+					{Spec: api.ServiceSpec{Port: 80}},
+				},
 			},
 			numErrs: 0,
 		},
@@ -737,30 +825,36 @@ func TestValidateService(t *testing.T) {
 						"NoUppercaseOrSpecialCharsLike=Equals": "bar",
 					},
 				},
-				Port:     80,
-				Selector: map[string]string{"foo": "bar", "NoUppercaseOrSpecialCharsLike=Equals": "bar"},
+				Spec: api.ServiceSpec{
+					Port:     8675,
+					Selector: map[string]string{"foo": "bar", "NoUppercaseOrSpecialCharsLike=Equals": "bar"},
+				},
 			},
 			numErrs: 2,
 		},
 	}
 
 	for _, tc := range testCases {
-		errs := ValidateService(&tc.svc)
+		registry := registrytest.NewServiceRegistry()
+		registry.List = tc.existing
+		errs := ValidateService(&tc.svc, registry, api.NewDefaultContext())
 		if len(errs) != tc.numErrs {
 			t.Errorf("Unexpected error list for case %q: %+v", tc.name, errs)
 		}
 	}
 
 	svc := api.Service{
-		Port:       6502,
 		ObjectMeta: api.ObjectMeta{Name: "foo", Namespace: api.NamespaceDefault},
-		Selector:   map[string]string{"foo": "bar"},
+		Spec: api.ServiceSpec{
+			Port:     8675,
+			Selector: map[string]string{"foo": "bar"},
+		},
 	}
-	errs := ValidateService(&svc)
+	errs := ValidateService(&svc, registrytest.NewServiceRegistry(), api.NewDefaultContext())
 	if len(errs) != 0 {
 		t.Errorf("Unexpected non-zero error list: %#v", errs)
 	}
-	if svc.Protocol != "TCP" {
+	if svc.Spec.Protocol != "TCP" {
 		t.Errorf("Expected default protocol of 'TCP': %#v", errs)
 	}
 }
@@ -768,43 +862,41 @@ func TestValidateService(t *testing.T) {
 func TestValidateReplicationController(t *testing.T) {
 	validSelector := map[string]string{"a": "b"}
 	validPodTemplate := api.PodTemplate{
-		DesiredState: api.PodState{
-			Manifest: api.ContainerManifest{
-				Version: "v1beta1",
+		Spec: api.PodTemplateSpec{
+			ObjectMeta: api.ObjectMeta{
+				Labels: validSelector,
 			},
 		},
-		Labels: validSelector,
 	}
 	invalidVolumePodTemplate := api.PodTemplate{
-		DesiredState: api.PodState{
-			Manifest: api.ContainerManifest{
-				Version: "v1beta1",
+		Spec: api.PodTemplateSpec{
+			Spec: api.PodSpec{
 				Volumes: []api.Volume{{Name: "gcepd", Source: &api.VolumeSource{GCEPersistentDisk: &api.GCEPersistentDisk{"my-PD", "ext4", 1, false}}}},
 			},
 		},
 	}
 	invalidSelector := map[string]string{"NoUppercaseOrSpecialCharsLike=Equals": "b"}
 	invalidPodTemplate := api.PodTemplate{
-		DesiredState: api.PodState{
-			Manifest: api.ContainerManifest{
-				Version: "v1beta1",
+		Spec: api.PodTemplateSpec{
+			Spec: api.PodSpec{},
+			ObjectMeta: api.ObjectMeta{
+				Labels: invalidSelector,
 			},
 		},
-		Labels: invalidSelector,
 	}
 	successCases := []api.ReplicationController{
 		{
 			ObjectMeta: api.ObjectMeta{Name: "abc", Namespace: api.NamespaceDefault},
-			DesiredState: api.ReplicationControllerState{
-				ReplicaSelector: validSelector,
-				PodTemplate:     validPodTemplate,
+			Spec: api.ReplicationControllerSpec{
+				Selector: validSelector,
+				Template: &validPodTemplate.Spec,
 			},
 		},
 		{
 			ObjectMeta: api.ObjectMeta{Name: "abc-123", Namespace: api.NamespaceDefault},
-			DesiredState: api.ReplicationControllerState{
-				ReplicaSelector: validSelector,
-				PodTemplate:     validPodTemplate,
+			Spec: api.ReplicationControllerSpec{
+				Selector: validSelector,
+				Template: &validPodTemplate.Spec,
 			},
 		},
 	}
@@ -817,49 +909,49 @@ func TestValidateReplicationController(t *testing.T) {
 	errorCases := map[string]api.ReplicationController{
 		"zero-length ID": {
 			ObjectMeta: api.ObjectMeta{Name: "", Namespace: api.NamespaceDefault},
-			DesiredState: api.ReplicationControllerState{
-				ReplicaSelector: validSelector,
-				PodTemplate:     validPodTemplate,
+			Spec: api.ReplicationControllerSpec{
+				Selector: validSelector,
+				Template: &validPodTemplate.Spec,
 			},
 		},
 		"missing-namespace": {
 			ObjectMeta: api.ObjectMeta{Name: "abc-123"},
-			DesiredState: api.ReplicationControllerState{
-				ReplicaSelector: validSelector,
-				PodTemplate:     validPodTemplate,
+			Spec: api.ReplicationControllerSpec{
+				Selector: validSelector,
+				Template: &validPodTemplate.Spec,
 			},
 		},
 		"empty selector": {
 			ObjectMeta: api.ObjectMeta{Name: "abc", Namespace: api.NamespaceDefault},
-			DesiredState: api.ReplicationControllerState{
-				PodTemplate: validPodTemplate,
+			Spec: api.ReplicationControllerSpec{
+				Template: &validPodTemplate.Spec,
 			},
 		},
 		"selector_doesnt_match": {
 			ObjectMeta: api.ObjectMeta{Name: "abc", Namespace: api.NamespaceDefault},
-			DesiredState: api.ReplicationControllerState{
-				ReplicaSelector: map[string]string{"foo": "bar"},
-				PodTemplate:     validPodTemplate,
+			Spec: api.ReplicationControllerSpec{
+				Selector: map[string]string{"foo": "bar"},
+				Template: &validPodTemplate.Spec,
 			},
 		},
 		"invalid manifest": {
 			ObjectMeta: api.ObjectMeta{Name: "abc", Namespace: api.NamespaceDefault},
-			DesiredState: api.ReplicationControllerState{
-				ReplicaSelector: validSelector,
+			Spec: api.ReplicationControllerSpec{
+				Selector: validSelector,
 			},
 		},
 		"read-write presistent disk": {
 			ObjectMeta: api.ObjectMeta{Name: "abc"},
-			DesiredState: api.ReplicationControllerState{
-				ReplicaSelector: validSelector,
-				PodTemplate:     invalidVolumePodTemplate,
+			Spec: api.ReplicationControllerSpec{
+				Selector: validSelector,
+				Template: &invalidVolumePodTemplate.Spec,
 			},
 		},
 		"negative_replicas": {
 			ObjectMeta: api.ObjectMeta{Name: "abc", Namespace: api.NamespaceDefault},
-			DesiredState: api.ReplicationControllerState{
-				Replicas:        -1,
-				ReplicaSelector: validSelector,
+			Spec: api.ReplicationControllerSpec{
+				Replicas: -1,
+				Selector: validSelector,
 			},
 		},
 		"invalid_label": {
@@ -870,9 +962,9 @@ func TestValidateReplicationController(t *testing.T) {
 					"NoUppercaseOrSpecialCharsLike=Equals": "bar",
 				},
 			},
-			DesiredState: api.ReplicationControllerState{
-				ReplicaSelector: validSelector,
-				PodTemplate:     validPodTemplate,
+			Spec: api.ReplicationControllerSpec{
+				Selector: validSelector,
+				Template: &validPodTemplate.Spec,
 			},
 		},
 		"invalid_label 2": {
@@ -883,8 +975,8 @@ func TestValidateReplicationController(t *testing.T) {
 					"NoUppercaseOrSpecialCharsLike=Equals": "bar",
 				},
 			},
-			DesiredState: api.ReplicationControllerState{
-				PodTemplate: invalidPodTemplate,
+			Spec: api.ReplicationControllerSpec{
+				Template: &invalidPodTemplate.Spec,
 			},
 		},
 	}
@@ -895,13 +987,14 @@ func TestValidateReplicationController(t *testing.T) {
 		}
 		for i := range errs {
 			field := errs[i].(errors.ValidationError).Field
-			if !strings.HasPrefix(field, "desiredState.podTemplate.") &&
+			if !strings.HasPrefix(field, "spec.template.") &&
 				field != "name" &&
 				field != "namespace" &&
-				field != "desiredState.replicaSelector" &&
+				field != "spec.selector" &&
+				field != "spec.template" &&
 				field != "GCEPersistentDisk.ReadOnly" &&
-				field != "desiredState.replicas" &&
-				field != "desiredState.label" &&
+				field != "spec.replicas" &&
+				field != "spec.template.label" &&
 				field != "label" {
 				t.Errorf("%s: missing prefix for: %v", k, errs[i])
 			}
@@ -923,6 +1016,52 @@ func TestValidateBoundPodNoName(t *testing.T) {
 	for k, v := range errorCases {
 		if errs := ValidateBoundPod(&v); len(errs) == 0 {
 			t.Errorf("expected failure for %s", k)
+		}
+	}
+}
+
+func TestValidateMinion(t *testing.T) {
+	validSelector := map[string]string{"a": "b"}
+	invalidSelector := map[string]string{"NoUppercaseOrSpecialCharsLike=Equals": "b"}
+	successCases := []api.Minion{
+		{
+			ObjectMeta: api.ObjectMeta{Name: "abc"},
+			HostIP:     "something",
+			Labels:     validSelector,
+		},
+		{
+			ObjectMeta: api.ObjectMeta{Name: "abc"},
+			HostIP:     "something",
+		},
+	}
+	for _, successCase := range successCases {
+		if errs := ValidateMinion(&successCase); len(errs) != 0 {
+			t.Errorf("expected success: %v", errs)
+		}
+	}
+
+	errorCases := map[string]api.Minion{
+		"zero-length Name": {
+			ObjectMeta: api.ObjectMeta{Name: ""},
+			HostIP:     "something",
+			Labels:     validSelector,
+		},
+		"invalid-labels": {
+			ObjectMeta: api.ObjectMeta{Name: "abc-123"},
+			Labels:     invalidSelector,
+		},
+	}
+	for k, v := range errorCases {
+		errs := ValidateMinion(&v)
+		if len(errs) == 0 {
+			t.Errorf("expected failure for %s", k)
+		}
+		for i := range errs {
+			field := errs[i].(errors.ValidationError).Field
+			if field != "name" &&
+				field != "label" {
+				t.Errorf("%s: missing prefix for: %v", k, errs[i])
+			}
 		}
 	}
 }

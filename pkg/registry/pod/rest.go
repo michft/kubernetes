@@ -32,7 +32,6 @@ import (
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/watch"
 
-	"code.google.com/p/go-uuid/uuid"
 	"github.com/golang/glog"
 )
 
@@ -93,7 +92,7 @@ func (rs *REST) Create(ctx api.Context, obj runtime.Object) (<-chan apiserver.RE
 	if !api.ValidNamespace(ctx, &pod.ObjectMeta) {
 		return nil, errors.NewConflict("pod", pod.Namespace, fmt.Errorf("Pod.Namespace does not match the provided context"))
 	}
-	pod.DesiredState.Manifest.UUID = uuid.NewUUID().String()
+	pod.DesiredState.Manifest.UUID = util.NewUUID().String()
 	if len(pod.Name) == 0 {
 		pod.Name = pod.DesiredState.Manifest.UUID
 	}
@@ -101,7 +100,8 @@ func (rs *REST) Create(ctx api.Context, obj runtime.Object) (<-chan apiserver.RE
 	if errs := validation.ValidatePod(pod); len(errs) > 0 {
 		return nil, errors.NewInvalid("pod", pod.Name, errs)
 	}
-	pod.CreationTimestamp = util.Now()
+
+	api.FillObjectMetaSystemFields(ctx, &pod.ObjectMeta)
 
 	return apiserver.MakeAsync(func() (runtime.Object, error) {
 		if err := rs.registry.CreatePod(ctx, pod); err != nil {
@@ -268,9 +268,9 @@ func getInstanceIPFromCloud(cloud cloudprovider.Interface, host string) string {
 	return addr.String()
 }
 
-func getPodStatus(pod *api.Pod, minions client.MinionInterface) (api.PodStatus, error) {
+func getPodStatus(pod *api.Pod, minions client.MinionInterface) (api.PodCondition, error) {
 	if pod.CurrentState.Host == "" {
-		return api.PodWaiting, nil
+		return api.PodPending, nil
 	}
 	if minions != nil {
 		res, err := minions.List()
@@ -286,13 +286,13 @@ func getPodStatus(pod *api.Pod, minions client.MinionInterface) (api.PodStatus, 
 			}
 		}
 		if !found {
-			return api.PodTerminated, nil
+			return api.PodFailed, nil
 		}
 	} else {
 		glog.Errorf("Unexpected missing minion interface, status may be in-accurate")
 	}
 	if pod.CurrentState.Info == nil {
-		return api.PodWaiting, nil
+		return api.PodPending, nil
 	}
 	running := 0
 	stopped := 0
@@ -314,10 +314,10 @@ func getPodStatus(pod *api.Pod, minions client.MinionInterface) (api.PodStatus, 
 	case running > 0 && unknown == 0:
 		return api.PodRunning, nil
 	case running == 0 && stopped > 0 && unknown == 0:
-		return api.PodTerminated, nil
+		return api.PodFailed, nil
 	case running == 0 && stopped == 0 && unknown > 0:
-		return api.PodWaiting, nil
+		return api.PodPending, nil
 	default:
-		return api.PodWaiting, nil
+		return api.PodPending, nil
 	}
 }

@@ -17,6 +17,7 @@ limitations under the License.
 package validation
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 
@@ -26,6 +27,11 @@ import (
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 )
+
+// ServiceLister is an abstract interface for testing.
+type ServiceLister interface {
+	ListServices(api.Context) (*api.ServiceList, error)
+}
 
 func validateVolumes(volumes []api.Volume) (util.StringSet, errs.ValidationErrorList) {
 	allErrs := errs.ValidationErrorList{}
@@ -162,7 +168,7 @@ func validateVolumeMounts(mounts []api.VolumeMount, volumes util.StringSet) errs
 		if len(mnt.Name) == 0 {
 			mErrs = append(mErrs, errs.NewFieldRequired("name", mnt.Name))
 		} else if !volumes.Has(mnt.Name) {
-			mErrs = append(mErrs, errs.NewNotFound("name", mnt.Name))
+			mErrs = append(mErrs, errs.NewFieldNotFound("name", mnt.Name))
 		}
 		if len(mnt.MountPath) == 0 {
 			mErrs = append(mErrs, errs.NewFieldRequired("mountPath", mnt.MountPath))
@@ -288,6 +294,7 @@ var supportedManifestVersions = util.NewStringSet("v1beta1", "v1beta2")
 // This includes checking formatting and uniqueness.  It also canonicalizes the
 // structure by setting default values and implementing any backwards-compatibility
 // tricks.
+// TODO: replaced by ValidatePodSpec
 func ValidateManifest(manifest *api.ContainerManifest) errs.ValidationErrorList {
 	allErrs := errs.ValidationErrorList{}
 
@@ -343,6 +350,21 @@ func ValidatePod(pod *api.Pod) errs.ValidationErrorList {
 	return allErrs
 }
 
+// ValidatePodSpec tests that the specified PodSpec has valid data.
+// This includes checking formatting and uniqueness.  It also canonicalizes the
+// structure by setting default values and implementing any backwards-compatibility
+// tricks.
+func ValidatePodSpec(spec *api.PodSpec) errs.ValidationErrorList {
+	allErrs := errs.ValidationErrorList{}
+
+	allVolumes, vErrs := validateVolumes(spec.Volumes)
+	allErrs = append(allErrs, vErrs.Prefix("volumes")...)
+	allErrs = append(allErrs, validateContainers(spec.Containers, allVolumes).Prefix("containers")...)
+	allErrs = append(allErrs, validateRestartPolicy(&spec.RestartPolicy).Prefix("restartPolicy")...)
+	allErrs = append(allErrs, validateLabels(spec.NodeSelector).Prefix("nodeSelector")...)
+	return allErrs
+}
+
 func validateLabels(labels map[string]string) errs.ValidationErrorList {
 	allErrs := errs.ValidationErrorList{}
 	for k := range labels {
@@ -382,7 +404,7 @@ func ValidatePodUpdate(newPod, oldPod *api.Pod) errs.ValidationErrorList {
 }
 
 // ValidateService tests if required fields in the service are set.
-func ValidateService(service *api.Service) errs.ValidationErrorList {
+func ValidateService(service *api.Service, lister ServiceLister, ctx api.Context) errs.ValidationErrorList {
 	allErrs := errs.ValidationErrorList{}
 	if len(service.Name) == 0 {
 		allErrs = append(allErrs, errs.NewFieldRequired("name", service.Name))
@@ -392,19 +414,34 @@ func ValidateService(service *api.Service) errs.ValidationErrorList {
 	if !util.IsDNSSubdomain(service.Namespace) {
 		allErrs = append(allErrs, errs.NewFieldInvalid("namespace", service.Namespace))
 	}
-	if !util.IsValidPortNum(service.Port) {
-		allErrs = append(allErrs, errs.NewFieldInvalid("port", service.Port))
+	if !util.IsValidPortNum(service.Spec.Port) {
+		allErrs = append(allErrs, errs.NewFieldInvalid("spec.port", service.Spec.Port))
 	}
-	if len(service.Protocol) == 0 {
-		service.Protocol = "TCP"
-	} else if !supportedPortProtocols.Has(strings.ToUpper(string(service.Protocol))) {
-		allErrs = append(allErrs, errs.NewFieldNotSupported("protocol", service.Protocol))
+	if len(service.Spec.Protocol) == 0 {
+		service.Spec.Protocol = "TCP"
+	} else if !supportedPortProtocols.Has(strings.ToUpper(string(service.Spec.Protocol))) {
+		allErrs = append(allErrs, errs.NewFieldNotSupported("spec.protocol", service.Spec.Protocol))
 	}
-	if labels.Set(service.Selector).AsSelector().Empty() {
-		allErrs = append(allErrs, errs.NewFieldRequired("selector", service.Selector))
+	if labels.Set(service.Spec.Selector).AsSelector().Empty() {
+		allErrs = append(allErrs, errs.NewFieldRequired("spec.selector", service.Spec.Selector))
+	}
+	if service.Spec.CreateExternalLoadBalancer {
+		services, err := lister.ListServices(ctx)
+		if err != nil {
+			allErrs = append(allErrs, errs.NewInternalError(err))
+		} else {
+			for i := range services.Items {
+				if services.Items[i].Name != service.Name &&
+					services.Items[i].Spec.CreateExternalLoadBalancer &&
+					services.Items[i].Spec.Port == service.Spec.Port {
+					allErrs = append(allErrs, errs.NewConflict("service", service.Name, fmt.Errorf("Port: %d is already in use", service.Spec.Port)))
+					break
+				}
+			}
+		}
 	}
 	allErrs = append(allErrs, validateLabels(service.Labels)...)
-	allErrs = append(allErrs, validateLabels(service.Selector)...)
+	allErrs = append(allErrs, validateLabels(service.Spec.Selector)...)
 	return allErrs
 }
 
@@ -417,30 +454,44 @@ func ValidateReplicationController(controller *api.ReplicationController) errs.V
 	if !util.IsDNSSubdomain(controller.Namespace) {
 		allErrs = append(allErrs, errs.NewFieldInvalid("namespace", controller.Namespace))
 	}
-	allErrs = append(allErrs, ValidateReplicationControllerState(&controller.DesiredState).Prefix("desiredState")...)
+	allErrs = append(allErrs, ValidateReplicationControllerSpec(&controller.Spec).Prefix("spec")...)
 	allErrs = append(allErrs, validateLabels(controller.Labels)...)
 	return allErrs
 }
 
-// ValidateReplicationControllerState tests if required fields in the replication controller state are set.
-func ValidateReplicationControllerState(state *api.ReplicationControllerState) errs.ValidationErrorList {
+// ValidateReplicationControllerSpec tests if required fields in the replication controller spec are set.
+func ValidateReplicationControllerSpec(spec *api.ReplicationControllerSpec) errs.ValidationErrorList {
 	allErrs := errs.ValidationErrorList{}
-	if labels.Set(state.ReplicaSelector).AsSelector().Empty() {
-		allErrs = append(allErrs, errs.NewFieldRequired("replicaSelector", state.ReplicaSelector))
+
+	selector := labels.Set(spec.Selector).AsSelector()
+	if selector.Empty() {
+		allErrs = append(allErrs, errs.NewFieldRequired("selector", spec.Selector))
 	}
-	selector := labels.Set(state.ReplicaSelector).AsSelector()
-	labels := labels.Set(state.PodTemplate.Labels)
-	if !selector.Matches(labels) {
-		allErrs = append(allErrs, errs.NewFieldInvalid("podTemplate.labels", state.PodTemplate))
+	if spec.Replicas < 0 {
+		allErrs = append(allErrs, errs.NewFieldInvalid("replicas", spec.Replicas))
 	}
-	allErrs = append(allErrs, validateLabels(labels)...)
-	if state.Replicas < 0 {
-		allErrs = append(allErrs, errs.NewFieldInvalid("replicas", state.Replicas))
+
+	if spec.Template == nil {
+		allErrs = append(allErrs, errs.NewFieldRequired("template", spec.Template))
+	} else {
+		labels := labels.Set(spec.Template.Labels)
+		if !selector.Matches(labels) {
+			allErrs = append(allErrs, errs.NewFieldInvalid("template.labels", spec.Template.Labels))
+		}
+		allErrs = append(allErrs, validateLabels(spec.Template.Labels).Prefix("template.labels")...)
+		allErrs = append(allErrs, ValidatePodTemplateSpec(spec.Template).Prefix("template")...)
 	}
-	allErrs = append(allErrs, ValidateManifest(&state.PodTemplate.DesiredState.Manifest).Prefix("podTemplate.desiredState.manifest")...)
-	allErrs = append(allErrs, ValidateReadOnlyPersistentDisks(state.PodTemplate.DesiredState.Manifest.Volumes).Prefix("podTemplate.desiredState.manifest")...)
 	return allErrs
 }
+
+// ValidatePodTemplateSpec validates the spec of a pod template
+func ValidatePodTemplateSpec(spec *api.PodTemplateSpec) errs.ValidationErrorList {
+	allErrs := errs.ValidationErrorList{}
+	allErrs = append(allErrs, ValidatePodSpec(&spec.Spec).Prefix("spec")...)
+	allErrs = append(allErrs, ValidateReadOnlyPersistentDisks(spec.Spec.Volumes).Prefix("spec.volumes")...)
+	return allErrs
+}
+
 func ValidateReadOnlyPersistentDisks(volumes []api.Volume) errs.ValidationErrorList {
 	allErrs := errs.ValidationErrorList{}
 	for _, vol := range volumes {
@@ -473,4 +524,14 @@ func ValidateBoundPod(pod *api.BoundPod) (errors []error) {
 		errors = append(errors, errs...)
 	}
 	return errors
+}
+
+// ValidateMinion tests if required fields in the minion are set.
+func ValidateMinion(minion *api.Minion) errs.ValidationErrorList {
+	allErrs := errs.ValidationErrorList{}
+	if len(minion.Name) == 0 {
+		allErrs = append(allErrs, errs.NewFieldRequired("name", minion.Name))
+	}
+	allErrs = append(allErrs, validateLabels(minion.Labels)...)
+	return allErrs
 }

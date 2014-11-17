@@ -26,7 +26,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
@@ -200,10 +199,11 @@ func main() {
 
 	if clientConfig.Host == "" {
 		// TODO: eventually apiserver should start on 443 and be secure by default
+		// TODO: don't specify http or https in Host, and infer that from auth options.
 		clientConfig.Host = "http://localhost:8080"
 	}
-	if client.IsConfigTransportSecure(clientConfig) {
-		auth, err := kubecfg.LoadAuthInfo(*authConfig, os.Stdin)
+	if client.IsConfigTransportTLS(clientConfig) {
+		auth, err := kubecfg.LoadClientAuthInfoOrPrompt(*authConfig, os.Stdin)
 		if err != nil {
 			glog.Fatalf("Error loading auth: %v", err)
 		}
@@ -324,13 +324,11 @@ func getPrinter() kubecfg.ResourcePrinter {
 		} else {
 			data = []byte(*templateStr)
 		}
-		tmpl, err := template.New("output").Parse(string(data))
+		var err error
+		printer, err = kubecfg.NewTemplatePrinter(data)
 		if err != nil {
-			glog.Fatalf("Error parsing template %s, %v\n", string(data), err)
+			glog.Fatalf("Error '%v' parsing template:\n'%s'", err, string(data))
 			return nil
-		}
-		printer = &kubecfg.TemplatePrinter{
-			Template: tmpl,
 		}
 	default:
 		printer = humanReadablePrinter()

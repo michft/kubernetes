@@ -28,6 +28,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/clientauth"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/wait"
@@ -51,23 +52,15 @@ func promptForString(field string, r io.Reader) string {
 	return result
 }
 
-type AuthInfo struct {
-	User        string
-	Password    string
-	CAFile      string
-	CertFile    string
-	KeyFile     string
-	BearerToken string
-	Insecure    *bool
-}
-
 type NamespaceInfo struct {
 	Namespace string
 }
 
-// LoadAuthInfo parses an AuthInfo object from a file path. It prompts user and creates file if it doesn't exist.
-func LoadAuthInfo(path string, r io.Reader) (*AuthInfo, error) {
-	var auth AuthInfo
+// LoadClientAuthInfoOrPrompt parses a clientauth.Info object from a file path. It prompts user and creates file if it doesn't exist.
+// Oddly, it returns a clientauth.Info even if there is an error.
+func LoadClientAuthInfoOrPrompt(path string, r io.Reader) (*clientauth.Info, error) {
+	var auth clientauth.Info
+	// Prompt for user/pass and write a file if none exists.
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		auth.User = promptForString("Username", r)
 		auth.Password = promptForString("Password", r)
@@ -78,15 +71,11 @@ func LoadAuthInfo(path string, r io.Reader) (*AuthInfo, error) {
 		err = ioutil.WriteFile(path, data, 0600)
 		return &auth, err
 	}
-	data, err := ioutil.ReadFile(path)
+	authPtr, err := clientauth.LoadFromFile(path)
 	if err != nil {
 		return nil, err
 	}
-	err = json.Unmarshal(data, &auth)
-	if err != nil {
-		return nil, err
-	}
-	return &auth, err
+	return authPtr, nil
 }
 
 // LoadNamespaceInfo parses a NamespaceInfo object from a file path. It creates a file at the specified path if it doesn't exist with the default namespace.
@@ -134,14 +123,14 @@ func Update(ctx api.Context, name string, client client.Interface, updatePeriod 
 	}
 
 	if len(imageName) != 0 {
-		controller.DesiredState.PodTemplate.DesiredState.Manifest.Containers[0].Image = imageName
+		controller.Spec.Template.Spec.Containers[0].Image = imageName
 		controller, err = client.ReplicationControllers(controller.Namespace).Update(controller)
 		if err != nil {
 			return err
 		}
 	}
 
-	s := labels.Set(controller.DesiredState.ReplicaSelector).AsSelector()
+	s := labels.Set(controller.Spec.Selector).AsSelector()
 
 	podList, err := client.Pods(api.Namespace(ctx)).List(s)
 	if err != nil {
@@ -181,7 +170,7 @@ func ResizeController(ctx api.Context, name string, replicas int, client client.
 	if err != nil {
 		return err
 	}
-	controller.DesiredState.Replicas = replicas
+	controller.Spec.Replicas = replicas
 	controllerOut, err := client.ReplicationControllers(api.Namespace(ctx)).Update(controller)
 	if err != nil {
 		return err
@@ -251,26 +240,25 @@ func RunController(ctx api.Context, image, name string, replicas int, client cli
 		ObjectMeta: api.ObjectMeta{
 			Name: name,
 		},
-		DesiredState: api.ReplicationControllerState{
+		Spec: api.ReplicationControllerSpec{
 			Replicas: replicas,
-			ReplicaSelector: map[string]string{
+			Selector: map[string]string{
 				"name": name,
 			},
-			PodTemplate: api.PodTemplate{
-				DesiredState: api.PodState{
-					Manifest: api.ContainerManifest{
-						Version: "v1beta2",
-						Containers: []api.Container{
-							{
-								Name:  strings.ToLower(name),
-								Image: image,
-								Ports: ports,
-							},
-						},
+			Template: &api.PodTemplateSpec{
+				ObjectMeta: api.ObjectMeta{
+					Labels: map[string]string{
+						"name": name,
 					},
 				},
-				Labels: map[string]string{
-					"name": name,
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{
+							Name:  strings.ToLower(name),
+							Image: image,
+							Ports: ports,
+						},
+					},
 				},
 			},
 		},
@@ -309,9 +297,11 @@ func createService(ctx api.Context, name string, port int, client client.Interfa
 				"name": name,
 			},
 		},
-		Port: port,
-		Selector: map[string]string{
-			"name": name,
+		Spec: api.ServiceSpec{
+			Port: port,
+			Selector: map[string]string{
+				"name": name,
+			},
 		},
 	}
 	svc, err := client.Services(api.Namespace(ctx)).Create(svc)
@@ -326,8 +316,8 @@ func DeleteController(ctx api.Context, name string, client client.Interface) err
 	if err != nil {
 		return err
 	}
-	if controller.DesiredState.Replicas != 0 {
-		return fmt.Errorf("controller has non-zero replicas (%d), please stop it first", controller.DesiredState.Replicas)
+	if controller.Spec.Replicas != 0 {
+		return fmt.Errorf("controller has non-zero replicas (%d), please stop it first", controller.Spec.Replicas)
 	}
 	return client.ReplicationControllers(api.Namespace(ctx)).Delete(name)
 }

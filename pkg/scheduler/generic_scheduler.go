@@ -53,6 +53,9 @@ func (g *genericScheduler) Schedule(pod api.Pod, minionLister MinionLister) (str
 }
 
 func (g *genericScheduler) selectHost(priorityList HostPriorityList) (string, error) {
+	if len(priorityList) == 0 {
+		return "", fmt.Errorf("empty priorityList")
+	}
 	sort.Sort(priorityList)
 
 	hosts := getMinHosts(priorityList)
@@ -103,12 +106,12 @@ func getMinHosts(list HostPriorityList) []string {
 // EqualPriority is a prioritizer function that gives an equal weight of one to all nodes
 func EqualPriority(pod api.Pod, podLister PodLister, minionLister MinionLister) (HostPriorityList, error) {
 	nodes, err := minionLister.List()
-	result := []HostPriority{}
-
 	if err != nil {
 		fmt.Errorf("failed to list nodes: %v", err)
 		return []HostPriority{}, err
 	}
+
+	result := []HostPriority{}
 	for _, minion := range nodes.Items {
 		result = append(result, HostPriority{
 			host:  minion.Name,

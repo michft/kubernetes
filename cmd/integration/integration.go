@@ -19,7 +19,6 @@ limitations under the License.
 package main
 
 import (
-	"encoding/json"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -36,6 +35,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/errors"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/latest"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/testapi"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/apiserver"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
 	minionControllerPkg "github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/controller"
 	replicationControllerPkg "github.com/GoogleCloudPlatform/kubernetes/pkg/controller"
@@ -110,14 +110,28 @@ func startComponents(manifestURL string) (apiServerURL string) {
 	apiServer := httptest.NewServer(&handler)
 
 	etcdClient := etcd.NewClient(servers)
-	keys, err := etcdClient.Get("/", false, false)
-	if err != nil {
-		glog.Fatalf("Unable to list root etcd keys: %v", err)
-	}
-	for _, node := range keys.Node.Nodes {
-		if _, err := etcdClient.Delete(node.Key, true); err != nil {
-			glog.Fatalf("Unable delete key: %v", err)
+	sleep := 4 * time.Second
+	ok := false
+	for i := 0; i < 3; i++ {
+		keys, err := etcdClient.Get("/", false, false)
+		if err != nil {
+			glog.Warningf("Unable to list root etcd keys: %v", err)
+			if i < 2 {
+				time.Sleep(sleep)
+				sleep = sleep * sleep
+			}
+			continue
 		}
+		for _, node := range keys.Node.Nodes {
+			if _, err := etcdClient.Delete(node.Key, true); err != nil {
+				glog.Fatalf("Unable delete key: %v", err)
+			}
+		}
+		ok = true
+		break
+	}
+	if !ok {
+		glog.Fatalf("Failed to connect to etcd")
 	}
 
 	cl := client.NewOrDie(&client.Config{Host: apiServer.URL, Version: testapi.Version()})
@@ -146,7 +160,7 @@ func startComponents(manifestURL string) (apiServerURL string) {
 		KubeletClient:     fakeKubeletClient{},
 		EnableLogsSupport: false,
 		APIPrefix:         "/api",
-		AuthorizationMode: "AlwaysAllow",
+		Authorizer:        apiserver.NewAlwaysAllowAuthorizer(),
 
 		ReadWritePort: portNumber,
 		ReadOnlyPort:  portNumber,
@@ -236,24 +250,24 @@ func runReplicationControllerTest(c *client.Client) {
 	if err != nil {
 		glog.Fatalf("Unexpected error: %#v", err)
 	}
-	var controllerRequest api.ReplicationController
-	if err := json.Unmarshal(data, &controllerRequest); err != nil {
+	var controller api.ReplicationController
+	if err := api.Scheme.DecodeInto(data, &controller); err != nil {
 		glog.Fatalf("Unexpected error: %#v", err)
 	}
 
 	glog.Infof("Creating replication controllers")
-	if _, err := c.ReplicationControllers(api.NamespaceDefault).Create(&controllerRequest); err != nil {
+	if _, err := c.ReplicationControllers(api.NamespaceDefault).Create(&controller); err != nil {
 		glog.Fatalf("Unexpected error: %#v", err)
 	}
 	glog.Infof("Done creating replication controllers")
 
 	// Give the controllers some time to actually create the pods
-	if err := wait.Poll(time.Second, time.Second*30, c.ControllerHasDesiredReplicas(controllerRequest)); err != nil {
+	if err := wait.Poll(time.Second, time.Second*30, c.ControllerHasDesiredReplicas(controller)); err != nil {
 		glog.Fatalf("FAILED: pods never created %v", err)
 	}
 
 	// wait for minions to indicate they have info about the desired pods
-	pods, err := c.Pods(api.NamespaceDefault).List(labels.Set(controllerRequest.DesiredState.ReplicaSelector).AsSelector())
+	pods, err := c.Pods(api.NamespaceDefault).List(labels.Set(controller.Spec.Selector).AsSelector())
 	if err != nil {
 		glog.Fatalf("FAILED: unable to get pods to list: %v", err)
 	}
@@ -285,10 +299,12 @@ func runSelfLinkTest(c *client.Client) {
 					"name": "selflinktest",
 				},
 			},
-			Port: 12345,
-			// This is here because validation requires it.
-			Selector: map[string]string{
-				"foo": "bar",
+			Spec: api.ServiceSpec{
+				Port: 12345,
+				// This is here because validation requires it.
+				Selector: map[string]string{
+					"foo": "bar",
+				},
 			},
 		},
 	).Do().Into(&svc)
@@ -345,10 +361,12 @@ func runAtomicPutTest(c *client.Client) {
 					"name": "atomicService",
 				},
 			},
-			Port: 12345,
-			// This is here because validation requires it.
-			Selector: map[string]string{
-				"foo": "bar",
+			Spec: api.ServiceSpec{
+				Port: 12345,
+				// This is here because validation requires it.
+				Selector: map[string]string{
+					"foo": "bar",
+				},
 			},
 		},
 	).Do().Into(&svc)
@@ -379,10 +397,10 @@ func runAtomicPutTest(c *client.Client) {
 					glog.Errorf("Error getting atomicService: %v", err)
 					continue
 				}
-				if tmpSvc.Selector == nil {
-					tmpSvc.Selector = map[string]string{l: v}
+				if tmpSvc.Spec.Selector == nil {
+					tmpSvc.Spec.Selector = map[string]string{l: v}
 				} else {
-					tmpSvc.Selector[l] = v
+					tmpSvc.Spec.Selector[l] = v
 				}
 				glog.Infof("Posting update (%s, %s)", l, v)
 				err = c.Put().Path("services").Path(svc.Name).Body(&tmpSvc).Do().Error()
@@ -405,8 +423,8 @@ func runAtomicPutTest(c *client.Client) {
 	if err := c.Get().Path("services").Path(svc.Name).Do().Into(&svc); err != nil {
 		glog.Fatalf("Failed getting atomicService after writers are complete: %v", err)
 	}
-	if !reflect.DeepEqual(testLabels, labels.Set(svc.Selector)) {
-		glog.Fatalf("Selector PUTs were not atomic: wanted %v, got %v", testLabels, svc.Selector)
+	if !reflect.DeepEqual(testLabels, labels.Set(svc.Spec.Selector)) {
+		glog.Fatalf("Selector PUTs were not atomic: wanted %v, got %v", testLabels, svc.Spec.Selector)
 	}
 	glog.Info("Atomic PUTs work.")
 }
@@ -508,10 +526,12 @@ func runServiceTest(client *client.Client) {
 	}
 	svc1 := api.Service{
 		ObjectMeta: api.ObjectMeta{Name: "service1"},
-		Selector: map[string]string{
-			"name": "thisisalonglabel",
+		Spec: api.ServiceSpec{
+			Selector: map[string]string{
+				"name": "thisisalonglabel",
+			},
+			Port: 8080,
 		},
-		Port: 8080,
 	}
 	_, err = client.Services(api.NamespaceDefault).Create(&svc1)
 	if err != nil {
@@ -523,10 +543,12 @@ func runServiceTest(client *client.Client) {
 	// A second service with the same port.
 	svc2 := api.Service{
 		ObjectMeta: api.ObjectMeta{Name: "service2"},
-		Selector: map[string]string{
-			"name": "thisisalonglabel",
+		Spec: api.ServiceSpec{
+			Selector: map[string]string{
+				"name": "thisisalonglabel",
+			},
+			Port: 8080,
 		},
-		Port: 8080,
 	}
 	_, err = client.Services(api.NamespaceDefault).Create(&svc2)
 	if err != nil {
@@ -624,6 +646,7 @@ func ServeCachedManifestFile() (servingAddress string) {
 const (
 	// This is copied from, and should be kept in sync with:
 	// https://raw.githubusercontent.com/GoogleCloudPlatform/container-vm-guestbook-redis-python/master/manifest.yaml
+	// Note that kubelet complains about these containers not having a self link.
 	testManifestFile = `version: v1beta2
 id: container-vm-guestbook
 containers:

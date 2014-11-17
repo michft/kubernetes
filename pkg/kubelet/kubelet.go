@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path"
 	"sort"
 	"strconv"
@@ -30,6 +31,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/validation"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/capabilities"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/record"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/health"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubelet/dockertools"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools"
@@ -73,7 +75,8 @@ func NewMainKubelet(
 		resyncInterval:        ri,
 		networkContainerImage: ni,
 		podWorkers:            newPodWorkers(),
-		runner:                dockertools.NewDockerContainerCommandRunner(),
+		dockerIDToRef:         map[dockertools.DockerID]*api.ObjectReference{},
+		runner:                dockertools.NewDockerContainerCommandRunner(dc),
 		httpClient:            &http.Client{},
 		pullQPS:               pullQPS,
 		pullBurst:             pullBurst,
@@ -93,6 +96,7 @@ func NewIntegrationTestKubelet(hn string, rd string, dc dockertools.DockerInterf
 		networkContainerImage: NetworkContainerImage,
 		resyncInterval:        3 * time.Second,
 		podWorkers:            newPodWorkers(),
+		dockerIDToRef:         map[dockertools.DockerID]*api.ObjectReference{},
 	}
 }
 
@@ -109,6 +113,11 @@ type Kubelet struct {
 	podWorkers            *podWorkers
 	resyncInterval        time.Duration
 	pods                  []api.BoundPod
+
+	// Needed to report events for containers belonging to deleted/modified pods.
+	// Tracks references for reporting events
+	dockerIDToRef map[dockertools.DockerID]*api.ObjectReference
+	refLock       sync.RWMutex
 
 	// Optional, no events will be sent without it
 	etcdClient tools.EtcdClient
@@ -259,11 +268,6 @@ func (self *podWorkers) Run(podFullName string, action func()) {
 	}()
 }
 
-// LogEvent reports an event.
-func (kl *Kubelet) LogEvent(event *api.Event) error {
-	return nil
-}
-
 func makeEnvironmentVariables(container *api.Container) []string {
 	var result []string
 	for _, value := range container.Env {
@@ -287,7 +291,6 @@ func makeBinds(pod *api.BoundPod, container *api.Container, podVolumes volumeMap
 	}
 	return binds
 }
-
 func makePortsAndBindings(container *api.Container) (map[docker.Port]struct{}, map[docker.Port][]docker.PortBinding) {
 	exposedPorts := map[docker.Port]struct{}{}
 	portBindings := map[docker.Port][]docker.PortBinding{}
@@ -381,8 +384,67 @@ func (kl *Kubelet) runHandler(podFullName, uuid string, container *api.Container
 	return actionHandler.Run(podFullName, uuid, container, handler)
 }
 
+// fieldPath returns a fieldPath locating container within pod.
+// Returns an error if the container isn't part of the pod.
+func fieldPath(pod *api.BoundPod, container *api.Container) (string, error) {
+	for i := range pod.Spec.Containers {
+		here := &pod.Spec.Containers[i]
+		if here == container {
+			return fmt.Sprintf("spec.containers[%n]", i), nil
+		}
+	}
+	return "", fmt.Errorf("container %#v not found in pod %#v", container, pod)
+}
+
+// containerRef returns an *api.ObjectReference which references the given container within the
+// given pod. Returns an error if the reference can't be constructed or the container doesn't
+// actually belong to the pod.
+// TODO: Pods that came to us by static config or over HTTP have no selfLink set, which makes
+// this fail and log an error. Figure out how we want to identify these pods to the rest of the
+// system.
+func containerRef(pod *api.BoundPod, container *api.Container) (*api.ObjectReference, error) {
+	fieldPath, err := fieldPath(pod, container)
+	if err != nil {
+		// TODO: figure out intelligent way to refer to containers that we implicitly
+		// start (like the network container). This is not a good way, ugh.
+		fieldPath = "implicitly required container " + container.Name
+	}
+	ref, err := api.GetPartialReference(pod, fieldPath)
+	if err != nil {
+		return nil, err
+	}
+	return ref, nil
+}
+
+// setRef stores a reference to a pod's container, associating it with the given docker id.
+func (kl *Kubelet) setRef(id dockertools.DockerID, ref *api.ObjectReference) {
+	kl.refLock.Lock()
+	defer kl.refLock.Unlock()
+	kl.dockerIDToRef[id] = ref
+}
+
+// clearRef forgets the given docker id and its associated container reference.
+func (kl *Kubelet) clearRef(id dockertools.DockerID) {
+	kl.refLock.Lock()
+	defer kl.refLock.Unlock()
+	delete(kl.dockerIDToRef, id)
+}
+
+// getRef returns the container reference of the given id, or (nil, false) if none is stored.
+func (kl *Kubelet) getRef(id dockertools.DockerID) (ref *api.ObjectReference, ok bool) {
+	kl.refLock.RLock()
+	defer kl.refLock.RUnlock()
+	ref, ok = kl.dockerIDToRef[id]
+	return ref, ok
+}
+
 // Run a single container from a pod. Returns the docker container ID
 func (kl *Kubelet) runContainer(pod *api.BoundPod, container *api.Container, podVolumes volumeMap, netMode string) (id dockertools.DockerID, err error) {
+	ref, err := containerRef(pod, container)
+	if err != nil {
+		glog.Errorf("Couldn't make a ref to pod %v, container %v: '%v'", pod.Name, container.Name, err)
+	}
+
 	envVariables := makeEnvironmentVariables(container)
 	binds := makeBinds(pod, container, podVolumes)
 	exposedPorts, portBindings := makePortsAndBindings(container)
@@ -402,7 +464,32 @@ func (kl *Kubelet) runContainer(pod *api.BoundPod, container *api.Container, pod
 	}
 	dockerContainer, err := kl.dockerClient.CreateContainer(opts)
 	if err != nil {
+		if ref != nil {
+			record.Eventf(ref, "failed", "failed",
+				"Failed to create docker container with error(%v)", err)
+		}
 		return "", err
+	}
+	// Remember this reference so we can report events about this container
+	if ref != nil {
+		kl.setRef(dockertools.DockerID(dockerContainer.ID), ref)
+		record.Eventf(ref, "waiting", "created", "Created with docker id %v", dockerContainer.ID)
+	}
+
+	if len(container.TerminationMessagePath) != 0 {
+		p := path.Join(kl.rootDirectory, pod.Name, container.Name)
+		if err := os.MkdirAll(p, 0750); err != nil {
+			glog.Errorf("Error on creating %s(%v)", p, err)
+		} else {
+			containerLogPath := path.Join(p, dockerContainer.ID)
+			fs, err := os.Create(containerLogPath)
+			if err != nil {
+				glog.Errorf("Error on creating termination-log file: %s(%v)", containerLogPath, err)
+			}
+			defer fs.Close()
+			b := fmt.Sprintf("%s:%s", containerLogPath, container.TerminationMessagePath)
+			binds = append(binds, b)
+		}
 	}
 	privileged := false
 	if capabilities.Get().AllowPrivileged {
@@ -416,7 +503,18 @@ func (kl *Kubelet) runContainer(pod *api.BoundPod, container *api.Container, pod
 		NetworkMode:  netMode,
 		Privileged:   privileged,
 	})
-	if err == nil && container.Lifecycle != nil && container.Lifecycle.PostStart != nil {
+	if err != nil {
+		if ref != nil {
+			record.Eventf(ref, "failed", "failed",
+				"Failed to start with docker id %v with error(%v)", dockerContainer.ID, err)
+		}
+		return "", err
+	}
+	if ref != nil {
+		record.Eventf(ref, "running", "started", "Started with docker id %v", dockerContainer.ID)
+	}
+
+	if container.Lifecycle != nil && container.Lifecycle.PostStart != nil {
 		handlerErr := kl.runHandler(GetPodFullName(pod), pod.UID, container, container.Lifecycle.PostStart)
 		if handlerErr != nil {
 			kl.killContainerByID(dockerContainer.ID, "")
@@ -438,9 +536,13 @@ func (kl *Kubelet) killContainerByID(ID, name string) error {
 		return err
 	}
 
-	// TODO(lavalamp): restore event logging:
-	// podFullName, uuid, containerName, _ := dockertools.ParseDockerName(name)
-	// kl.LogEvent(&api.Event{})
+	ref, ok := kl.getRef(dockertools.DockerID(ID))
+	if !ok {
+		glog.Warningf("No ref for pod '%v' - '%v'", ID, name)
+	} else {
+		// TODO: pass reason down here, and state, or move this call up the stack.
+		record.Eventf(ref, "terminated", "killing", "Killing %v - %v", ID, name)
+	}
 
 	return err
 }
@@ -588,6 +690,14 @@ func (kl *Kubelet) syncPod(pod *api.BoundPod, dockerContainers dockertools.Docke
 				continue
 			}
 			killedContainers[containerID] = empty{}
+
+			// Also kill associated network container
+			if netContainer, found, _ := dockerContainers.FindPodContainer(podFullName, uuid, networkContainerName); found {
+				if err := kl.killContainer(netContainer); err != nil {
+					glog.V(1).Infof("Failed to kill network container %s: %v", netContainer.ID, err)
+					continue
+				}
+			}
 		}
 
 		// Check RestartPolicy for container
@@ -616,11 +726,13 @@ func (kl *Kubelet) syncPod(pod *api.BoundPod, dockerContainers dockertools.Docke
 		glog.V(3).Infof("Container with name %s--%s--%s doesn't exist, creating %#v", podFullName, uuid, container.Name, container)
 		if !api.IsPullNever(container.ImagePullPolicy) {
 			present, err := kl.dockerPuller.IsImagePresent(container.Image)
+			latest := dockertools.RequireLatestImage(container.Image)
 			if err != nil {
 				glog.Errorf("Failed to inspect image: %s: %#v skipping pod %s container %s", container.Image, err, podFullName, container.Name)
 				continue
 			}
-			if api.IsPullAlways(container.ImagePullPolicy) || !present {
+			if api.IsPullAlways(container.ImagePullPolicy) ||
+				(api.IsPullIfNotPresent(container.ImagePullPolicy) && (!present || latest)) {
 				if err := kl.dockerPuller.Pull(container.Image); err != nil {
 					glog.Errorf("Failed to pull image %s: %v skipping pod %s container %s.", container.Image, err, podFullName, container.Name)
 					continue
@@ -899,4 +1011,17 @@ func (kl *Kubelet) RunInContainer(podFullName, uuid, container string, cmd []str
 		return nil, fmt.Errorf("container not found (%s)", container)
 	}
 	return kl.runner.RunInContainer(dockerContainer.ID, cmd)
+}
+
+// BirthCry sends an event that the kubelet has started up.
+func (kl *Kubelet) BirthCry() {
+	// Make an event that kubelet restarted.
+	// TODO: get the real minion object of ourself,
+	// and use the real minion name and UID.
+	ref := &api.ObjectReference{
+		Kind: "Minion",
+		Name: kl.hostname,
+		UID:  kl.hostname,
+	}
+	record.Eventf(ref, "", "starting", "Starting kubelet.")
 }

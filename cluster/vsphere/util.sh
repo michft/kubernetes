@@ -397,9 +397,9 @@ function kube-up {
   (
     umask 077
 
-    kube-ssh "${KUBE_MASTER_IP}" sudo cat /usr/share/nginx/kubecfg.crt >"${HOME}/${kube_cert}" 2>/dev/null
-    kube-ssh "${KUBE_MASTER_IP}" sudo cat /usr/share/nginx/kubecfg.key >"${HOME}/${kube_key}" 2>/dev/null
-    kube-ssh "${KUBE_MASTER_IP}" sudo cat /usr/share/nginx/ca.crt >"${HOME}/${ca_cert}" 2>/dev/null
+    kube-ssh "${KUBE_MASTER_IP}" sudo cat /srv/kubernetes/kubecfg.crt >"${HOME}/${kube_cert}" 2>/dev/null
+    kube-ssh "${KUBE_MASTER_IP}" sudo cat /srv/kubernetes/kubecfg.key >"${HOME}/${kube_key}" 2>/dev/null
+    kube-ssh "${KUBE_MASTER_IP}" sudo cat /srv/kubernetes/ca.crt >"${HOME}/${ca_cert}" 2>/dev/null
 
     cat << EOF > ~/.kubernetes_auth
     {
@@ -470,4 +470,12 @@ function test-setup {
 # Execute after running tests to perform any required clean-up
 function test-teardown {
 	echo "TODO"
+}
+
+function setup-monitoring {
+    echo "TODO"
+}
+
+function teardown-monitoring {
+  echo "TODO"
 }

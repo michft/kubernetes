@@ -112,7 +112,7 @@ when the backend `services` is created, the Kubernetes master assigns a portal
 IP address, for example 10.0.0.1.  Assuming the `service` port is 1234, the
 portal is 10.0.0.1:1234.  The master stores that information, which is then
 observed by all of the `service proxy` instances in the cluster.  When a proxy
-sees a new portal, it opens a new random port, establish an iptables redirect
+sees a new portal, it opens a new random port, establishes an iptables redirect
 from the portal to this new port, and starts accepting connections on it.
 
 When a client connects to `MYAPP_SERVICE_HOST` on the portal port (whether
@@ -127,16 +127,10 @@ being aware of which `pods` they are accessing.
 
 ![Services detailed diagram](services_detail.png)
 
+## External Services
+For some parts of your application (e.g. your frontend) you want to expose a service on an external (publically visible) IP address.  To achieve this, you can set the ```createExternalLoadBalancer``` flag on the service.  This sets up a cloud provider specific load balancer (assuming that it is supported by your cloud provider) and also sets up IPTables rules on each host that map packets from the specified External IP address to the service proxy in the same manner as internal service IP addresses.
+
 ## Shortcomings
-
-Part of the `service` specification is a `createExternalLoadBalancer` flag,
-which tells the master to make an external load balancer that points to the
-service.  In order to do this today, the service proxy must answer on a known
-(i.e. not random) port.  In this case, the service port is promoted to the
-proxy port.  This means that is is still possible for users to collide with
-each others services or with other pods.  We expect most `services` will not
-set this flag, mitigating the exposure.
-
 We expect that using iptables for portals will work at small scale, but will
 not scale to large clusters with thousands of services.  See [the original
 design proposal for

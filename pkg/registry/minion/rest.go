@@ -23,11 +23,12 @@ import (
 	"strconv"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
+	kerrors "github.com/GoogleCloudPlatform/kubernetes/pkg/api/errors"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/validation"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/apiserver"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/master/ports"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 )
 
 // REST implements the RESTStorage interface, backed by a MinionRegistry.
@@ -50,21 +51,19 @@ func (rs *REST) Create(ctx api.Context, obj runtime.Object) (<-chan apiserver.RE
 	if !ok {
 		return nil, fmt.Errorf("not a minion: %#v", obj)
 	}
-	if minion.Name == "" {
-		return nil, fmt.Errorf("ID should not be empty: %#v", minion)
+
+	if errs := validation.ValidateMinion(minion); len(errs) > 0 {
+		return nil, kerrors.NewInvalid("minion", minion.Name, errs)
 	}
 
-	minion.CreationTimestamp = util.Now()
+	api.FillObjectMetaSystemFields(ctx, &minion.ObjectMeta)
 
 	return apiserver.MakeAsync(func() (runtime.Object, error) {
+		// TODO: Need to fill in any server-set fields (uid, timestamp, etc) before
+		// returning minion. Can't do it properly at the moment because the registry
+		// healthchecking, which might cause it to not return the minion at all. Fix
+		// this after we move the healthchecking out of the minion registry.
 		err := rs.registry.CreateMinion(ctx, minion)
-		if err != nil {
-			return nil, err
-		}
-		minion, err := rs.registry.GetMinion(ctx, minion.Name)
-		if minion == nil {
-			return nil, ErrDoesNotExist
-		}
 		if err != nil {
 			return nil, err
 		}

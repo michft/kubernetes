@@ -20,6 +20,7 @@ import (
 	"errors"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/auth/authorizer"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/auth/authorizer/abac"
 )
 
 // Attributes implements authorizer.Attributes interface.
@@ -36,6 +37,10 @@ func (alwaysAllowAuthorizer) Authorize(a authorizer.Attributes) (err error) {
 	return nil
 }
 
+func NewAlwaysAllowAuthorizer() authorizer.Authorizer {
+	return new(alwaysAllowAuthorizer)
+}
+
 // alwaysDenyAuthorizer is an implementation of authorizer.Attributes
 // which always says no to an authorization request.
 // It is useful in unit tests to force an operation to be forbidden.
@@ -45,23 +50,33 @@ func (alwaysDenyAuthorizer) Authorize(a authorizer.Attributes) (err error) {
 	return errors.New("Everything is forbidden.")
 }
 
+func NewAlwaysDenyAuthorizer() authorizer.Authorizer {
+	return new(alwaysDenyAuthorizer)
+}
+
 const (
 	ModeAlwaysAllow string = "AlwaysAllow"
 	ModeAlwaysDeny  string = "AlwaysDeny"
+	ModeABAC        string = "ABAC"
 )
 
 // Keep this list in sync with constant list above.
-var AuthorizationModeChoices = []string{ModeAlwaysAllow, ModeAlwaysDeny}
+var AuthorizationModeChoices = []string{ModeAlwaysAllow, ModeAlwaysDeny, ModeABAC}
 
 // NewAuthorizerFromAuthorizationConfig returns the right sort of authorizer.Authorizer
 // based on the authorizationMode xor an error.  authorizationMode should be one of AuthorizationModeChoices.
-func NewAuthorizerFromAuthorizationConfig(authorizationMode string) (authorizer.Authorizer, error) {
+func NewAuthorizerFromAuthorizationConfig(authorizationMode string, authorizationPolicyFile string) (authorizer.Authorizer, error) {
+	if authorizationPolicyFile != "" && authorizationMode != "ABAC" {
+		return nil, errors.New("Cannot specify --authorization_policy_file without mode ABAC")
+	}
 	// Keep cases in sync with constant list above.
 	switch authorizationMode {
 	case ModeAlwaysAllow:
-		return new(alwaysAllowAuthorizer), nil
+		return NewAlwaysAllowAuthorizer(), nil
 	case ModeAlwaysDeny:
-		return new(alwaysDenyAuthorizer), nil
+		return NewAlwaysDenyAuthorizer(), nil
+	case ModeABAC:
+		return abac.NewFromFile(authorizationPolicyFile)
 	default:
 		return nil, errors.New("Unknown authorization mode")
 	}

@@ -52,6 +52,7 @@ const (
 	ValidationErrorTypeForbidden ValidationErrorType = "FieldValueForbidden"
 )
 
+// ValueOf converts a ValidationErrorType into its corresponding error message.
 func ValueOf(t ValidationErrorType) string {
 	switch t {
 	case ValidationErrorTypeNotFound:
@@ -140,7 +141,7 @@ func (list ValidationErrorList) Prefix(prefix string) ValidationErrorList {
 			}
 			list[i] = err
 		} else {
-			glog.Warningf("ValidationErrorList holds non-ValidationError: %T", list)
+			glog.Warningf("Programmer error: ValidationErrorList holds non-ValidationError: %#v", list[i])
 		}
 	}
 	return list
